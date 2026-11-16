@@ -6,6 +6,7 @@
 只使用 Python 3 標準函式庫，不需安裝任何額外套件。
 """
 import argparse
+import codecs
 import json
 import locale
 import os
@@ -21,16 +22,148 @@ import zipfile
 from html.parser import HTMLParser
 from urllib.parse import unquote
 
-VERSION = '1.0'
+VERSION = '1.1'
 COLORS = ['white', 'green', 'blue']
-COLOR_NAMES = {'white': '白', 'green': '綠', 'blue': '藍'}
 MAX_WIDTH = 100          # 內文最大欄寬
 IMAGE = '<image>'
 
-WS = re.compile('[ \t\r\n\f\v]+')
-CTRL = re.compile('[\x00-\x08\x0b-\x1f\x7f-\x9f\xad​﻿]')
+WS = re.compile('[ \t\r\n\f\v\u2028\u2029]+')
+CTRL = re.compile('[\x00-\x08\x0b-\x1f\x7f-\x9f\xad\u200b\u2028\u2029\ufeff]')
+DECOMPOSED = re.compile('[\u0300-\u036f\u1100-\u11ff\u3099\u309a]')
 SCHEME = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.\-]*:')
-NOSTART = set('，。、；：？！）」』】》〉’”,.;:?!)]}…')
+NOSTART = set('，。、；：？！）」』】》〉’”,.;:?!)]}…ー々')    # 不可出現在行首
+NOEND = set('（「『【《〈‘“([{')                               # 不可出現在行尾
+
+
+# --------------------------------------------------------------------------
+# 介面語言
+# --------------------------------------------------------------------------
+LANGS = ['zh', 'en']
+LANG = 'zh'
+CHOSEN = None            # 閱讀中按 L 切換後的語言（離開時寫入設定）
+STR = {
+    'zh': {
+        'desc': '輕量終端機電子書閱讀器 (epub / mobi / azw3 / fb2 / html / txt)',
+        'epilog': '不帶檔名執行時會開啟上次閱讀的書。閱讀中按 ? 顯示按鍵說明。',
+        'arg_file': '電子書檔案',
+        'arg_color': '文字顏色 (預設沿用上次的設定)',
+        'arg_lang': '介面語言：zh 中文 / en English（會記住）',
+        'arg_enc': '強制指定文字編碼，例如 big5、gbk、sjis、cp1251（每本書會記住）',
+        'arg_dump': '輸出純文字後離開',
+        'lang_set': '介面語言已設為中文',
+        'lang_now': '語言: 中文',
+        'bad_enc': '不認得的編碼: %s',
+        'not_found': '找不到檔案: %s',
+        'cant_read': '無法讀取 %s: %s',
+        'drm': '此檔案有 DRM 保護，無法讀取',
+        'bad_comp': '不支援的壓縮格式 %d',
+        'bad_file': '檔案格式錯誤 (%s)',
+        'empty': '（沒有可顯示的內容）',
+        'goto': '跳到頁碼: %s_   (Enter 確認, Esc 取消)',
+        'total': '共 %d 頁',
+        'status': '%d/%d 頁 %d%%  ?:說明',
+        'range': '頁碼超出範圍 (1-%d)',
+        'last': '已經是最後一頁',
+        'first': '已經是第一頁',
+        'no_links': '本頁沒有連結',
+        'ext_link': '外部連結: %s',
+        'no_target': '找不到連結目標: %s',
+        'no_back': '沒有可返回的位置',
+        'no_next': '沒有下一章',
+        'no_prev': '沒有上一章',
+        'no_toc': '這本書沒有目錄',
+        'toc': '目錄',
+        'toc_hint': '↑↓ 選擇   Enter 前往   t / Esc 關閉',
+        'help_title': 'yreader %s 按鍵說明',
+        'anykey': '按任意鍵返回',
+        'color': '文字顏色: %s',
+        'white': '白', 'green': '綠', 'blue': '藍',
+    },
+    'en': {
+        'desc': 'A lightweight terminal ebook reader (epub / mobi / azw3 / fb2 / html / txt)',
+        'epilog': 'Run without a file to reopen the last book. Press ? while reading for key bindings.',
+        'arg_file': 'ebook file',
+        'arg_color': 'text color (defaults to the last one used)',
+        'arg_lang': 'interface language: zh (Chinese) / en (English); remembered',
+        'arg_enc': 'force a text encoding, e.g. big5, gbk, sjis, cp1251 (remembered per book)',
+        'arg_dump': 'print the book as plain text and exit',
+        'lang_set': 'Interface language set to English',
+        'lang_now': 'Language: English',
+        'bad_enc': 'unknown encoding: %s',
+        'not_found': 'file not found: %s',
+        'cant_read': 'cannot read %s: %s',
+        'drm': 'this file is DRM-protected and cannot be read',
+        'bad_comp': 'unsupported compression type %d',
+        'bad_file': 'malformed file (%s)',
+        'empty': '(nothing to display)',
+        'goto': 'Go to page: %s_   (Enter: go, Esc: cancel)',
+        'total': '%d pages',
+        'status': 'p.%d/%d  %d%%  ?:help',
+        'range': 'Page out of range (1-%d)',
+        'last': 'Already at the last page',
+        'first': 'Already at the first page',
+        'no_links': 'No links on this page',
+        'ext_link': 'External link: %s',
+        'no_target': 'Link target not found: %s',
+        'no_back': 'Nowhere to go back to',
+        'no_next': 'No next chapter',
+        'no_prev': 'No previous chapter',
+        'no_toc': 'This book has no table of contents',
+        'toc': 'Contents',
+        'toc_hint': 'Up/Down: select   Enter: go   t / Esc: close',
+        'help_title': 'yreader %s key bindings',
+        'anykey': 'Press any key to return',
+        'color': 'Text color: %s',
+        'white': 'white', 'green': 'green', 'blue': 'blue',
+    },
+}
+HELP = {
+    'zh': [
+        ('空白 → ↓ PgDn j l', '下一頁'),
+        ('← ↑ PgUp k h', '上一頁'),
+        ('數字 + Enter', '跳到指定頁碼'),
+        ('g / Home', '第一頁'),
+        ('G / End', '最後一頁'),
+        ('[  /  ]', '上一章 / 下一章'),
+        ('t', '目錄'),
+        ('Tab / Shift-Tab', '選取本頁下一個 / 上一個連結'),
+        ('Enter', '開啟選取的連結'),
+        ('Backspace / b', '返回跳轉前的位置'),
+        ('c', '切換文字顏色（白 / 綠 / 藍）'),
+        ('L', '切換介面語言（中文 / English）'),
+        ('?', '顯示這份說明'),
+        ('q', '離開（自動保存閱讀進度）'),
+    ],
+    'en': [
+        ('Space → ↓ PgDn j l', 'Next page'),
+        ('← ↑ PgUp k h', 'Previous page'),
+        ('Number + Enter', 'Go to page'),
+        ('g / Home', 'First page'),
+        ('G / End', 'Last page'),
+        ('[  /  ]', 'Previous / next chapter'),
+        ('t', 'Table of contents'),
+        ('Tab / Shift-Tab', 'Select next / previous link'),
+        ('Enter', 'Follow the selected link'),
+        ('Backspace / b', 'Go back to where you were'),
+        ('c', 'Text color: white / green / blue'),
+        ('L', 'Language: Chinese / English'),
+        ('?', 'Show this help'),
+        ('q', 'Quit (reading position is saved)'),
+    ],
+}
+
+
+def T(key, *args):
+    s = STR[LANG][key]
+    return s % args if args else s
+
+
+def guess_lang():
+    for v in ('LC_ALL', 'LC_MESSAGES', 'LANG'):
+        val = os.environ.get(v)
+        if val:
+            return 'zh' if val.lower().startswith('zh') else 'en'
+    return 'en'
 
 
 # --------------------------------------------------------------------------
@@ -45,7 +178,8 @@ def cwidth(ch):
         return 1
     w = _wcache.get(ch)
     if w is None:
-        if unicodedata.category(ch) in ('Mn', 'Me', 'Cf'):
+        if unicodedata.category(ch) in ('Mn', 'Me', 'Cf') or \
+                0x1160 <= o <= 0x11ff or 0xd7b0 <= o <= 0xd7ff:   # 組合符號、韓文字母的中聲/終聲
             w = 0
         elif unicodedata.east_asian_width(ch) in 'WF':
             w = 2
@@ -79,7 +213,7 @@ def wrap(text, width):
     while i < n:
         w = 0
         j = i
-        brk = -1
+        brk = pb = -1
         while j < n:
             ch = text[j]
             cw = cwidth(ch)
@@ -87,9 +221,13 @@ def wrap(text, width):
                 break
             w += cw
             j += 1
-            if ch == ' ' or cw == 2:
-                brk = j
-            elif j < n and cwidth(text[j]) == 2:
+            if cw == 0:
+                if ch == '\u200d':       # ZWJ：前後都不可斷行（表情符號組合）
+                    brk = pb
+                elif brk == j - 1:       # 組合符號要跟著前一個字
+                    brk = j
+            elif ch == ' ' or cw == 2 or (j < n and cwidth(text[j]) == 2):
+                pb = brk
                 brk = j
         if j >= n:
             out.append((i, n))
@@ -101,6 +239,10 @@ def wrap(text, width):
         else:
             e = j if j > i else i + 1
         if text[e] in NOSTART and e - 1 > i:      # 避頭點
+            e -= 1
+            while e - 1 > i and cwidth(text[e]) == 0:
+                e -= 1
+        if text[e - 1] in NOEND and e - 1 > i:    # 避尾點
             e -= 1
         out.append((i, e))
         i = e
@@ -201,7 +343,7 @@ class Doc(object):
     def finish(self):
         self.flush()
         if not self.paras:
-            self.paras.append(Para('（沒有可顯示的內容）', 'p', 1, False, []))
+            self.paras.append(Para(T('empty'), 'p', 1, False, []))
         toc = []
         for lvl, title, key in self.rawtoc:
             t = self.lookup(key)
@@ -333,31 +475,117 @@ class ContentParser(HTMLParser):
             for i, ln in enumerate(data.split('\n')):
                 if i:
                     d.flush('pre', 0)
-                d.add(CTRL.sub('', ln.expandtabs(4)))
+                d.add(norm(CTRL.sub('', ln.expandtabs(4))))
             return
-        s = CTRL.sub('', WS.sub(' ', data)).replace('\xa0', ' ')
+        s = norm(CTRL.sub('', WS.sub(' ', data)).replace('\xa0', ' '))
         if d.curlen == 0 or d.endspace:
             s = s.lstrip(' ')
         d.add(s)
 
 
-def decode(raw, extra=()):
+def norm(s):
+    """把拆開的組合字（NFD 的越南文、韓文、日文濁音等）合併，避免寬度算錯與顯示錯亂"""
+    return unicodedata.normalize('NFC', s) if DECOMPOSED.search(s) else s
+
+
+FORCE_ENC = None         # --encoding 指定的編碼
+ALIAS = {'gb2312': 'gb18030', 'gbk': 'gb18030', 'gb_2312-80': 'gb18030', 'x-gbk': 'gb18030',
+         'big5': 'big5hkscs', 'big5-hkscs': 'big5hkscs', 'x-x-big5': 'big5hkscs',
+         'shift_jis': 'cp932', 'shift-jis': 'cp932', 'sjis': 'cp932', 'x-sjis': 'cp932',
+         'euc-kr': 'cp949', 'euc_kr': 'cp949', 'ks_c_5601-1987': 'cp949',
+         'iso-8859-1': 'cp1252', 'latin1': 'cp1252', 'iso8859-1': 'cp1252'}
+CJK_COMMON = set('的一是不了人我在有他這这为為之大来來以个個中上们們到说說国國和地也子时時道出而要于於'
+                 '就下得可你年生自会會那后後能对對着著事其里裡所去行过過家十用发發天如然作方成者多日都三'
+                 '小二无無同么麼经經法当當起与與好看学學进進种種将將还還分此心前面又定见見只主没沒公从從'
+                 '，。、「」『』！？：；…—“”')
+
+
+def cjk_score(text, kind):
+    """猜的編碼對不對：解出來的非 ASCII 字元裡，該語言常見字元所佔的比例"""
+    n = kana = hangul = common = 0
+    for c in text:
+        o = ord(c)
+        if o < 0x80:
+            continue
+        n += 1
+        if 0x3040 <= o <= 0x30ff:
+            kana += 1
+        elif 0xac00 <= o <= 0xd7a3:
+            hangul += 1
+        elif c in CJK_COMMON:
+            common += 1
+        if n >= 20000:
+            break
+    if not n:
+        return 0.0
+    n = float(n)
+    if kind == 'ko':          # 真正的韓文幾乎全是諺文
+        return hangul / n if hangul / n >= 0.85 else 0.0
+    if kind == 'ja':          # 日文一定有相當比例的假名
+        return (kana + common) / n if kana / n >= 0.15 else 0.0
+    if kind == 'zh':
+        return common / n
+    return max(hangul / n if hangul / n >= 0.85 else 0.0, (kana + common) / n)
+
+
+def guess_decode(raw):
+    """沒有標示編碼、也不是 UTF-8 時，猜測中日韓常見編碼（含沒有 BOM 的 UTF-16）"""
+    best, bs = None, 0.0
+    for enc, kind in (('big5hkscs', 'zh'), ('gb18030', 'zh'), ('cp932', 'ja'), ('euc_jp', 'ja'),
+                      ('cp949', 'ko'), ('utf-16-le', ''), ('utf-16-be', '')):
+        try:
+            t = raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+        sc = cjk_score(t, kind)
+        if sc > bs:
+            best, bs = t, sc
+    if best is not None and bs >= 0.15:
+        return best
+    try:
+        enc = codecs.lookup(locale.getpreferredencoding(False)).name
+    except LookupError:
+        enc = 'utf-8'
+    if enc in ('utf-8', 'ascii'):
+        enc = 'cp1252'
+    try:
+        return raw.decode(enc)
+    except UnicodeDecodeError:
+        return raw.decode('cp1252', 'replace')
+
+
+def decode(raw):
+    if FORCE_ENC:
+        return raw.decode(FORCE_ENC, 'replace')
     if raw[:3] == b'\xef\xbb\xbf':
         return raw[3:].decode('utf-8', 'replace')
     if raw[:2] in (b'\xff\xfe', b'\xfe\xff'):
         return raw.decode('utf-16', 'replace')
-    encs = []
-    m = re.search(br'''(?:encoding|charset)\s*=\s*["']?([\w\-]+)''', raw[:1024])
+    if b'\0' in raw[:4096]:                    # 沒有 BOM 的 UTF-16：兩種位元組順序取較合理者
+        best, bs = None, 0.15
+        for enc in ('utf-16-le', 'utf-16-be'):
+            try:
+                t = raw.decode(enc)
+            except UnicodeDecodeError:
+                continue
+            head = t[:20000]
+            sc = sum(1 for c in head if ' ' <= c < '\x7f' or c == '\n') / float(len(head) or 1) \
+                + cjk_score(head, '')
+            if sc > bs:
+                best, bs = t, sc
+        if best is not None:
+            return best
+    encs = ['utf-8']
+    m = re.search(br"""(?:encoding|charset)\s*=\s*["']?([\w\-]+)""", raw[:1024])
     if m:
-        encs.append(m.group(1).decode('ascii', 'replace'))
-    encs.append('utf-8')
-    encs.extend(extra)
+        name = m.group(1).decode('ascii', 'replace').lower()
+        encs.append(ALIAS.get(name, name))
     for enc in encs:
         try:
             return raw.decode(enc)
         except (LookupError, UnicodeDecodeError):
             pass
-    return raw.decode('utf-8', 'replace')
+    return guess_decode(raw)
 
 
 # --------------------------------------------------------------------------
@@ -439,11 +667,21 @@ def ncx_toc(xml, base):
 def load_epub(path, doc):
     z = zipfile.ZipFile(path)
     names = set(z.namelist())
-    lower = dict((n.lower(), n) for n in names)
+    loose = {}
+
+    def nk(n):
+        return unicodedata.normalize('NFC', n).lower()
+
+    for n in names:
+        loose.setdefault(nk(n), n)
+        try:      # 檔名其實是 UTF-8 卻沒有標示的 zip
+            loose.setdefault(nk(n.encode('cp437').decode('utf-8')), n)
+        except UnicodeError:
+            pass
 
     def read(name):
         if name not in names:
-            name = lower[name.lower()]
+            name = loose[nk(name)]
         return z.read(name)
 
     opf = None
@@ -452,7 +690,7 @@ def load_epub(path, doc):
             opf = unquote(e.get('full-path') or '')
             break
     if not opf:
-        raise ValueError('找不到 OPF')
+        raise ValueError(T('bad_file', 'OPF'))
     opfdir = posixpath.dirname(opf)
     manifest, spine, tocid = {}, [], None
     for e in ET.fromstring(read(opf)).iter():
@@ -542,7 +780,7 @@ class Huff(object):
 
     def __init__(self, huff, cdics):
         if huff[:8] != b'HUFF\x00\x00\x00\x18':
-            raise MobiError('HUFF 標頭錯誤')
+            raise MobiError(T('bad_file', 'HUFF'))
         off1, off2 = struct.unpack_from('>LL', huff, 8)
         self.dict1 = []
         for v in struct.unpack_from('<256L', huff, off1):
@@ -554,7 +792,7 @@ class Huff(object):
         self.dictionary = []
         for cdic in cdics:
             if cdic[:8] != b'CDIC\x00\x00\x00\x10':
-                raise MobiError('CDIC 標頭錯誤')
+                raise MobiError(T('bad_file', 'CDIC'))
             phrases, bits = struct.unpack_from('>LL', cdic, 8)
             n = min(1 << bits, phrases - len(self.dictionary))
             for off in struct.unpack_from('>%dH' % n, cdic, 16):
@@ -676,7 +914,7 @@ class Mobi(object):
     def index(self, idx):
         data = self.rec(idx)
         if data[:4] != b'INDX':
-            raise MobiError('INDX 錯誤')
+            raise MobiError(T('bad_file', 'INDX'))
         hlen, = struct.unpack_from('>L', data, 4)
         count, = struct.unpack_from('>L', data, 24)
         nctoc, = struct.unpack_from('>L', data, 52)
@@ -703,7 +941,7 @@ class Mobi(object):
         h = self.rec(0)
         comp, _, _, nrec, _, enc = struct.unpack_from('>HHLHHH', h, 0)
         if enc:
-            raise MobiError('此檔案有 DRM 保護，無法讀取')
+            raise MobiError(T('drm'))
 
         def u32(off):
             return struct.unpack_from('>L', h, off)[0] if off + 4 <= len(h) else NONE
@@ -713,13 +951,22 @@ class Mobi(object):
         if ismobi:
             hlen = u32(20)
             ver = u32(36)
-            if u32(28) == 65001:
+            cp = u32(28)
+            if cp == 65001:
                 codec = 'utf-8'
+            else:
+                try:
+                    codec = codecs.lookup('cp%d' % cp).name
+                except LookupError:
+                    pass
+        if FORCE_ENC:
+            codec = FORCE_ENC
+        if ismobi:
             if hlen >= 0xe4 and len(h) >= 0xf4:
                 extra, = struct.unpack_from('>H', h, 0xf2)
             toff, tlen = u32(0x54), u32(0x58)
             if toff != NONE and toff + tlen <= len(h):
-                title = h[toff:toff + tlen].decode(codec, 'replace')
+                title = ' '.join(CTRL.sub('', h[toff:toff + tlen].decode(codec, 'replace')).split())
 
         if comp == 1:
             dec = bytes
@@ -729,7 +976,7 @@ class Mobi(object):
             hoff, hnum = u32(0x70), u32(0x74)
             dec = Huff(self.rec(hoff), [self.rec(hoff + i) for i in range(1, hnum)]).unpack
         else:
-            raise MobiError('不支援的壓縮格式 %d' % comp)
+            raise MobiError(T('bad_comp', comp))
 
         trailers = bin(extra >> 1).count('1')
         parts = []
@@ -862,8 +1109,8 @@ def load_mobi(path, doc):
 # 其他格式與格式判斷
 # --------------------------------------------------------------------------
 def load_text(raw, doc):
-    for line in decode(raw, ('big5', 'gb18030', 'latin-1')).splitlines():
-        line = CTRL.sub('', line.expandtabs(4)).rstrip()
+    for line in decode(raw).splitlines():
+        line = norm(CTRL.sub('', line.expandtabs(4))).rstrip()
         if line.strip():
             doc.add(line)
             doc.flush('p', 0)
@@ -925,7 +1172,7 @@ def save_state(st):
         os.makedirs(os.path.dirname(p), exist_ok=True)
         tmp = p + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(st, f, ensure_ascii=False, indent=1)
+            json.dump(st, f, indent=1)
         os.replace(tmp, p)
     except OSError:
         pass
@@ -950,8 +1197,13 @@ def layout(paras, W, H):
                     lines.extend([BLANK] * (H - r))
             elif (p.gap or p.style == 'h' or prev.style == 'h') and len(lines) % H:
                 lines.append(BLANK)
+        segs = wrap(p.text, W)
+        if p.style == 'h':            # 標題不要孤零零留在頁尾
+            r = len(lines) % H
+            if r and len(segs) + 2 <= H and H - r < len(segs) + 2:
+                lines.extend([BLANK] * (H - r))
         first[pi] = len(lines)
-        for s, e in wrap(p.text, W):
+        for s, e in segs:
             lines.append((pi, s, e))
         prev = p
     return lines, first
@@ -960,23 +1212,6 @@ def layout(paras, W, H):
 # --------------------------------------------------------------------------
 # 介面
 # --------------------------------------------------------------------------
-HELP = [
-    ('空白 → ↓ PgDn j l', '下一頁'),
-    ('← ↑ PgUp k h', '上一頁'),
-    ('數字 + Enter', '跳到指定頁碼'),
-    ('g / Home', '第一頁'),
-    ('G / End', '最後一頁'),
-    ('[  /  ]', '上一章 / 下一章'),
-    ('t', '目錄'),
-    ('Tab / Shift-Tab', '選取本頁下一個 / 上一個連結'),
-    ('Enter', '開啟選取的連結'),
-    ('Backspace / b', '返回跳轉前的位置'),
-    ('c', '切換文字顏色（白 / 綠 / 藍）'),
-    ('?', '顯示這份說明'),
-    ('q', '離開（自動保存閱讀進度）'),
-]
-
-
 class Reader(object):
     def __init__(self, scr, curses, doc, pos, color):
         self.scr = scr
@@ -1080,6 +1315,12 @@ class Reader(object):
             self.scr.addstr(y, x, s, attr)
         except self.c.error:
             pass
+        except UnicodeError:      # 終端機編碼無法表示的字元
+            enc = getattr(self.scr, 'encoding', None) or 'ascii'
+            try:
+                self.scr.addstr(y, x, s.encode(enc, 'replace').decode(enc, 'replace'), attr)
+            except (self.c.error, UnicodeError, LookupError):
+                pass
         return x + swidth(s)
 
     def status(self, left, right=''):
@@ -1126,8 +1367,7 @@ class Reader(object):
                 self.put(y, x, p.text[pos:e], a)
 
         if self.numbuf is not None:
-            self.status('跳到頁碼: %s_   (Enter 確認, Esc 取消)' % self.numbuf,
-                        '共 %d 頁' % self.npages)
+            self.status(T('goto', self.numbuf), T('total', self.npages))
         else:
             left = self.msg
             if not left:
@@ -1136,7 +1376,7 @@ class Reader(object):
                 if ti >= 0 and self.doc.toc[ti][1] != self.doc.title:
                     left += ' ─ ' + self.doc.toc[ti][1]
             pct = 100 * (self.page + 1) // self.npages
-            self.status(left, '%d/%d 頁 %d%%  ?:說明' % (self.page + 1, self.npages, pct))
+            self.status(left, T('status', self.page + 1, self.npages, pct))
         self.msg = ''
         self.scr.refresh()
 
@@ -1172,7 +1412,7 @@ class Reader(object):
     def cycle_link(self, step):
         links = self.page_links()
         if not links:
-            self.msg = '本頁沒有連結'
+            self.msg = T('no_links')
             return
         if self.sel in links:
             self.sel = links[(links.index(self.sel) + step) % len(links)]
@@ -1186,17 +1426,17 @@ class Reader(object):
         pi, k = self.sel
         href = self.doc.paras[pi].links[k][2]
         if SCHEME.match(href):
-            self.msg = '外部連結: ' + href
+            self.msg = T('ext_link', href)
             return
         t = self.doc.lookup(href)
         if t is None:
-            self.msg = '找不到連結目標: ' + href
+            self.msg = T('no_target', href)
             return
         self.jump(t, mark=True)
 
     def back(self):
         if not self.hist:
-            self.msg = '沒有可返回的位置'
+            self.msg = T('no_back')
             return
         pos = self.hist.pop()
         self.page = min(self.line_of(pos) // self.H, self.npages - 1)
@@ -1212,14 +1452,14 @@ class Reader(object):
         if nxt:
             self.set_page(nxt[0], remember=True)
         else:
-            self.msg = '沒有下一章' if step > 0 else '沒有上一章'
+            self.msg = T('no_next' if step > 0 else 'no_prev')
 
     # ---- 目錄 / 說明 ----
     def toc_view(self):
         c = self.c
         toc = self.doc.toc
         if not toc:
-            self.msg = '這本書沒有目錄'
+            self.msg = T('no_toc')
             return
         cur = max(self.cur_toc(), 0)
         while True:
@@ -1230,7 +1470,7 @@ class Reader(object):
             top = min(max(0, cur - h // 2), max(0, len(toc) - h))
             attr = self.attr()
             self.scr.erase()
-            self.put(0, x0, '目錄', attr | c.A_BOLD)
+            self.put(0, x0, T('toc'), attr | c.A_BOLD)
             for y in range(h):
                 i = top + y
                 if i >= len(toc):
@@ -1240,7 +1480,7 @@ class Reader(object):
                 row = clip('  ' * min(lvl, 8) + title, w - len(pg) - 2)
                 row += ' ' * (w - len(pg) - swidth(row)) + pg
                 self.put(1 + y, x0, row, attr | (c.A_REVERSE if i == cur else 0))
-            self.status('↑↓ 選擇   Enter 前往   t / Esc 關閉', '%d/%d' % (cur + 1, len(toc)))
+            self.status(T('toc_hint'), '%d/%d' % (cur + 1, len(toc)))
             self.scr.refresh()
             k = self.getkey()
             if k == c.KEY_RESIZE:
@@ -1269,11 +1509,13 @@ class Reader(object):
             rows, cols = self.scr.getmaxyx()
             attr = self.attr()
             self.scr.erase()
-            self.put(0, 2, 'yreader %s 按鍵說明' % VERSION, attr | c.A_BOLD)
-            for i, (keys, desc) in enumerate(HELP):
+            self.put(0, 2, T('help_title', VERSION), attr | c.A_BOLD)
+            table = HELP[LANG]
+            col = 4 + max(swidth(keys) for keys, _ in table)
+            for i, (keys, desc) in enumerate(table):
                 self.put(2 + i, 2, keys, attr | c.A_BOLD)
-                self.put(2 + i, 24, desc, attr)
-            self.status('按任意鍵返回')
+                self.put(2 + i, col, desc, attr)
+            self.status(T('anykey'))
             self.scr.refresh()
             k = self.getkey()
             if k == c.KEY_RESIZE:
@@ -1283,6 +1525,7 @@ class Reader(object):
 
     # ---- 主迴圈 ----
     def loop(self):
+        global LANG, CHOSEN
         c = self.c
         nxt = {' ', 'j', 'l', 'n', 'f', c.KEY_DOWN, c.KEY_RIGHT, c.KEY_NPAGE}
         prv = {'k', 'h', 'p', c.KEY_UP, c.KEY_LEFT, c.KEY_PPAGE}
@@ -1306,18 +1549,18 @@ class Reader(object):
                         if 1 <= n <= self.npages:
                             self.set_page(n - 1, remember=True)
                         else:
-                            self.msg = '頁碼超出範圍 (1-%d)' % self.npages
+                            self.msg = T('range', self.npages)
                     self.numbuf = None
                 continue
             if isinstance(k, str) and k.isascii() and k.isdigit():
                 self.numbuf = k
             elif k in nxt:
                 if self.page >= self.npages - 1:
-                    self.msg = '已經是最後一頁'
+                    self.msg = T('last')
                 self.set_page(self.page + 1)
             elif k in prv:
                 if self.page == 0:
-                    self.msg = '已經是第一頁'
+                    self.msg = T('first')
                 self.set_page(self.page - 1)
             elif k in ('g', c.KEY_HOME):
                 self.set_page(0, remember=True)
@@ -1339,7 +1582,10 @@ class Reader(object):
                 self.toc_view()
             elif k == 'c':
                 self.ci = (self.ci + 1) % len(COLORS)
-                self.msg = '文字顏色: ' + COLOR_NAMES[COLORS[self.ci]]
+                self.msg = T('color', T(COLORS[self.ci]))
+            elif k == 'L':
+                LANG = CHOSEN = LANGS[(LANGS.index(LANG) + 1) % len(LANGS)]
+                self.msg = T('lang_now')
             elif k == '?':
                 self.help_view()
             elif k == '\x1b':
@@ -1363,23 +1609,73 @@ def dump(doc):
         pass
 
 
-def main():
-    ap = argparse.ArgumentParser(
-        prog='yreader',
-        description='輕量終端機電子書閱讀器 (epub / mobi / azw3 / fb2 / html / txt)',
-        epilog='不帶檔名執行時會開啟上次閱讀的書。閱讀中按 ? 顯示按鍵說明。')
-    ap.add_argument('file', nargs='?', help='電子書檔案')
-    ap.add_argument('-c', '--color', choices=COLORS, help='文字顏色 (預設沿用上次的設定)')
-    ap.add_argument('--dump', action='store_true', help='輸出純文字後離開')
-    ap.add_argument('-V', '--version', action='version', version='yreader ' + VERSION)
-    args = ap.parse_args()
+def can_show(text):
+    try:
+        text.encode(sys.stdout.encoding or 'ascii')
+        return True
+    except (UnicodeError, LookupError):
+        return False
 
+
+def ask_lang(default):
+    """第一次執行時詢問介面語言"""
+    zh = '繁體中文' if can_show('繁體中文') else 'Chinese'
+    sys.stdout.write('Select interface language:\n  1) %s\n  2) English\n[1/2] (default %d): '
+                     % (zh, LANGS.index(default) + 1))
+    sys.stdout.flush()
+    try:
+        ans = sys.stdin.readline().strip().lower()
+    except (OSError, UnicodeError, KeyboardInterrupt):
+        ans = ''
+    if ans in ('1', 'zh'):
+        return 'zh'
+    if ans in ('2', 'en'):
+        return 'en'
+    return default
+
+
+def main():
+    global LANG, FORCE_ENC
     try:
         locale.setlocale(locale.LC_ALL, '')
     except locale.Error:
         pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors='replace')
+        except (AttributeError, ValueError):
+            pass
     state = load_state()
     books = state['books']
+    saved_lang = state.get('lang') if state.get('lang') in LANGS else None
+    zh_ok = can_show(STR['zh']['desc'])      # 終端機無法顯示中文時暫時用英文（不改設定）
+    LANG = saved_lang or guess_lang()
+    if not zh_ok:
+        LANG = 'en'
+
+    ap = argparse.ArgumentParser(prog='yreader', description=T('desc'), epilog=T('epilog'))
+    ap.add_argument('file', nargs='?', help=T('arg_file'))
+    ap.add_argument('-c', '--color', choices=COLORS, help=T('arg_color'))
+    ap.add_argument('-l', '--lang', choices=LANGS, help=T('arg_lang'))
+    ap.add_argument('-e', '--encoding', metavar='ENC', help=T('arg_enc'))
+    ap.add_argument('--dump', action='store_true', help=T('arg_dump'))
+    ap.add_argument('-V', '--version', action='version', version='yreader ' + VERSION)
+    args = ap.parse_args()
+
+    if args.lang:
+        LANG = state['lang'] = args.lang
+        save_state(state)
+        if not zh_ok:
+            LANG = 'en'
+        if not args.file:
+            print(STR[args.lang]['lang_set'] if zh_ok else 'Interface language saved: ' + args.lang)
+            return 0
+    elif not saved_lang and not args.dump and sys.stdin.isatty() and sys.stdout.isatty():
+        LANG = state['lang'] = ask_lang(LANG)
+        save_state(state)
+        if not zh_ok:
+            LANG = 'en'
+
     path = args.file
     if not path:
         recent = sorted(books, key=lambda k: books[k].get('time', 0), reverse=True)
@@ -1388,12 +1684,24 @@ def main():
             ap.print_usage(sys.stderr)
             return 2
     if not os.path.isfile(path):
-        sys.stderr.write('yreader: 找不到檔案: %s\n' % path)
+        sys.stderr.write('yreader: %s\n' % T('not_found', path))
         return 1
+    key = os.path.realpath(path)
+    saved = books.get(key)
+    if not isinstance(saved, dict):
+        saved = {}
+    enc = args.encoding or saved.get('enc')
+    if enc:
+        try:
+            FORCE_ENC = codecs.lookup(ALIAS.get(str(enc).lower(), str(enc))).name
+        except LookupError:
+            if args.encoding:
+                sys.stderr.write('yreader: %s\n' % T('bad_enc', enc))
+                return 1
     try:
         doc = load(path)
     except Exception as e:
-        sys.stderr.write('yreader: 無法讀取 %s: %s\n' % (path, e or type(e).__name__))
+        sys.stderr.write('yreader: %s\n' % T('cant_read', path, e or type(e).__name__))
         return 1
 
     if args.dump or not sys.stdout.isatty():
@@ -1402,9 +1710,10 @@ def main():
 
     os.environ.setdefault('ESCDELAY', '25')
     import curses
-    key = os.path.realpath(path)
-    saved = books.get(key, {})
-    pos = (int(saved.get('para', 0)), int(saved.get('off', 0)))
+    try:
+        pos = (int(saved.get('para', 0)), int(saved.get('off', 0)))
+    except (TypeError, ValueError):
+        pos = (0, 0)
     color = args.color or state.get('color') or 'white'
 
     def bye(*_):
@@ -1422,7 +1731,11 @@ def main():
         finally:
             pi, off = r.position()
             books[key] = {'para': pi, 'off': off, 'title': doc.title, 'time': int(time.time())}
+            if FORCE_ENC:
+                books[key]['enc'] = FORCE_ENC
             state['color'] = COLORS[r.ci]
+            if CHOSEN:
+                state['lang'] = CHOSEN
             save_state(state)
 
     curses.wrapper(run)
