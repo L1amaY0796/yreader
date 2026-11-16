@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 電子書檔案（避免把有版權的書推上去）
+*.epub
+*.mobi
+*.azw
+*.azw3
+*.prc
+*.fb2
+
+# 編輯器 / 系統
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Claude Code 本機設定
+.claude/

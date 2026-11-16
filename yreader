@@ -1,0 +1,1433 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""yreader - 輕量終端機電子書閱讀器
+
+支援 epub / mobi / azw / azw3 / prc / fb2 / html / txt。
+只使用 Python 3 標準函式庫，不需安裝任何額外套件。
+"""
+import argparse
+import json
+import locale
+import os
+import posixpath
+import re
+import signal
+import struct
+import sys
+import time
+import unicodedata
+import xml.etree.ElementTree as ET
+import zipfile
+from html.parser import HTMLParser
+from urllib.parse import unquote
+
+VERSION = '1.0'
+COLORS = ['white', 'green', 'blue']
+COLOR_NAMES = {'white': '白', 'green': '綠', 'blue': '藍'}
+MAX_WIDTH = 100          # 內文最大欄寬
+IMAGE = '<image>'
+
+WS = re.compile('[ \t\r\n\f\v]+')
+CTRL = re.compile('[\x00-\x08\x0b-\x1f\x7f-\x9f\xad​﻿]')
+SCHEME = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.\-]*:')
+NOSTART = set('，。、；：？！）」』】》〉’”,.;:?!)]}…')
+
+
+# --------------------------------------------------------------------------
+# 文字寬度與換行
+# --------------------------------------------------------------------------
+_wcache = {}
+
+
+def cwidth(ch):
+    o = ord(ch)
+    if o < 0x300:
+        return 1
+    w = _wcache.get(ch)
+    if w is None:
+        if unicodedata.category(ch) in ('Mn', 'Me', 'Cf'):
+            w = 0
+        elif unicodedata.east_asian_width(ch) in 'WF':
+            w = 2
+        else:
+            w = 1
+        _wcache[ch] = w
+    return w
+
+
+def swidth(s):
+    return sum(cwidth(c) for c in s)
+
+
+def clip(s, w):
+    """把字串截到顯示寬度 w 以內"""
+    if w <= 0:
+        return ''
+    n = 0
+    for i, c in enumerate(s):
+        n += cwidth(c)
+        if n > w:
+            return s[:i]
+    return s
+
+
+def wrap(text, width):
+    """回傳 [(start, end)]，每段的顯示寬度不超過 width"""
+    out = []
+    n = len(text)
+    i = 0
+    while i < n:
+        w = 0
+        j = i
+        brk = -1
+        while j < n:
+            ch = text[j]
+            cw = cwidth(ch)
+            if w + cw > width:
+                break
+            w += cw
+            j += 1
+            if ch == ' ' or cw == 2:
+                brk = j
+            elif j < n and cwidth(text[j]) == 2:
+                brk = j
+        if j >= n:
+            out.append((i, n))
+            break
+        if text[j] == ' ':
+            e = j
+        elif brk > i:
+            e = brk
+        else:
+            e = j if j > i else i + 1
+        if text[e] in NOSTART and e - 1 > i:      # 避頭點
+            e -= 1
+        out.append((i, e))
+        i = e
+        while i < n and text[i] == ' ':
+            i += 1
+    return out
+
+
+# --------------------------------------------------------------------------
+# 文件模型
+# --------------------------------------------------------------------------
+class Para(object):
+    __slots__ = ('text', 'style', 'gap', 'newpage', 'links')
+
+    def __init__(self, text, style, gap, newpage, links):
+        self.text = text
+        self.style = style        # p / h / pre / hr
+        self.gap = gap            # 與前段之間是否空一行
+        self.newpage = newpage    # 是否從新的一頁開始
+        self.links = links        # [(start, end, href)]
+
+
+class Doc(object):
+    def __init__(self):
+        self.title = ''
+        self.paras = []
+        self.anchors = {}         # key -> (段落索引, 字元位移)
+        self.rawtoc = []          # [(層級, 標題, key)]
+        self.toc = []             # [(層級, 標題, (段落, 位移))]
+        self.cur = []
+        self.curlen = 0
+        self.endspace = False
+        self.curlinks = []
+        self.open = None          # (href, start)
+        self.nextgap = 1
+        self.newpage = False
+
+    def add(self, s):
+        if s:
+            self.cur.append(s)
+            self.curlen += len(s)
+            self.endspace = s[-1] == ' '
+
+    def pos(self):
+        return (len(self.paras), self.curlen)
+
+    def anchor(self, key):
+        self.anchors.setdefault(key, self.pos())
+
+    def open_link(self, href):
+        self.close_link()
+        self.open = (href, self.curlen)
+
+    def close_link(self):
+        if self.open:
+            href, s = self.open
+            if self.curlen > s:
+                self.curlinks.append((s, self.curlen, href))
+            self.open = None
+
+    def flush(self, style='p', gap=1):
+        href = self.open[0] if self.open else None
+        self.close_link()
+        text = ''.join(self.cur).rstrip()
+        if text.strip():
+            n = len(text)
+            links = [(s, min(e, n), h) for s, e, h in self.curlinks if s < n]
+            self.paras.append(Para(text, style, self.nextgap, self.newpage, links))
+            self.newpage = False
+            self.nextgap = gap
+        else:
+            self.nextgap = 1
+        self.cur = []
+        self.curlen = 0
+        self.endspace = False
+        self.curlinks = []
+        if href is not None:
+            self.open = (href, 0)
+
+    def start_file(self, name):
+        self.flush()
+        self.open = None
+        self.newpage = True
+        self.anchor(name)
+
+    def lookup(self, key):
+        t = self.anchors.get(key)
+        if t is None and '#' in key:
+            base = key.split('#')[0]
+            if base:
+                t = self.anchors.get(base)
+        if t is None or not self.paras:
+            return None
+        if t[0] >= len(self.paras):
+            return (len(self.paras) - 1, 0)
+        return t
+
+    def finish(self):
+        self.flush()
+        if not self.paras:
+            self.paras.append(Para('（沒有可顯示的內容）', 'p', 1, False, []))
+        toc = []
+        for lvl, title, key in self.rawtoc:
+            t = self.lookup(key)
+            if t and title:
+                toc.append((lvl, title, t))
+        if not toc:
+            toc = [(0, p.text, (i, 0)) for i, p in enumerate(self.paras) if p.style == 'h']
+        self.toc = toc
+
+
+def resolve(base, href):
+    """把相對連結轉成錨點 key（檔案路徑#id）"""
+    href = href.strip()
+    if SCHEME.match(href):
+        return href
+    path, _, frag = href.partition('#')
+    if path:
+        path = posixpath.normpath(posixpath.join(posixpath.dirname(base), unquote(path)))
+    else:
+        path = base
+    return path + '#' + unquote(frag) if frag else path
+
+
+# --------------------------------------------------------------------------
+# HTML -> 段落
+# --------------------------------------------------------------------------
+BLOCK = set('''p div h1 h2 h3 h4 h5 h6 li ul ol dl dt dd blockquote section article aside
+header footer nav figure figcaption table tr caption pre body html center address
+title subtitle empty-line v stanza epigraph text-author cite poem annotation'''.split())
+HEAD_HTML = {'h1', 'h2', 'h3', 'h4', 'h5', 'h6'}
+HEAD_FB2 = HEAD_HTML | {'title', 'subtitle'}
+SKIP_HTML = {'script', 'style', 'title', 'svg', 'rp', 'math'}
+SKIP_FB2 = {'script', 'style', 'binary', 'description'}
+
+
+class ContentParser(HTMLParser):
+    def __init__(self, doc, base='', fb2=False):
+        HTMLParser.__init__(self, convert_charrefs=True)
+        self.doc = doc
+        self.base = base
+        self.heads = HEAD_FB2 if fb2 else HEAD_HTML
+        self.skips = SKIP_FB2 if fb2 else SKIP_HTML
+        self.skip = 0
+        self.h = False
+        self.pre = False
+
+    def run(self, text):
+        try:
+            self.feed(text)
+            self.close()
+        except Exception:
+            pass
+        self.doc.flush(self.style())
+
+    def style(self):
+        return 'pre' if self.pre else 'h' if self.h else 'p'
+
+    def handle_starttag(self, tag, attrs):
+        d = self.doc
+        if self.skip:
+            if tag in self.skips:
+                self.skip += 1
+            return
+        if tag in self.skips:
+            if tag == 'svg':
+                d.add(IMAGE)
+            self.skip = 1
+            return
+        a = dict(attrs)
+        if tag in BLOCK:
+            d.flush(self.style())
+        i = a.get('id') or (a.get('name') if tag == 'a' else None)
+        if i:
+            d.anchor(self.base + '#' + i)
+        if tag == 'br':
+            d.flush(self.style(), 0)
+        elif tag == 'hr':
+            d.flush(self.style())
+            d.add('* * *')
+            d.flush('hr')
+        elif tag in ('img', 'image'):
+            d.add(IMAGE)
+        elif tag in self.heads:
+            self.h = True
+        elif tag == 'pre':
+            self.pre = True
+        elif tag == 'li':
+            if d.paras and d.paras[-1].text.startswith('• '):
+                d.nextgap = 0
+            d.add('• ')
+        elif tag in ('td', 'th'):
+            if d.curlen:
+                d.add(' │ ')
+        elif tag == 'a':
+            href = None
+            for k, v in attrs:
+                if v and (k == 'href' or k.endswith(':href')):
+                    href = v
+            if href:
+                d.open_link(resolve(self.base, href))
+        elif tag == 'mbp:pagebreak':
+            d.flush(self.style())
+            d.newpage = True
+        elif tag == 'rt':
+            d.add('(')
+
+    def handle_endtag(self, tag):
+        d = self.doc
+        if self.skip:
+            if tag in self.skips:
+                self.skip -= 1
+            return
+        if tag == 'a':
+            d.close_link()
+        elif tag == 'rt':
+            d.add(')')
+        elif tag in BLOCK:
+            d.flush(self.style())
+            if tag in self.heads:
+                self.h = False
+            elif tag == 'pre':
+                self.pre = False
+
+    def handle_data(self, data):
+        if self.skip:
+            return
+        d = self.doc
+        if self.pre:
+            for i, ln in enumerate(data.split('\n')):
+                if i:
+                    d.flush('pre', 0)
+                d.add(CTRL.sub('', ln.expandtabs(4)))
+            return
+        s = CTRL.sub('', WS.sub(' ', data)).replace('\xa0', ' ')
+        if d.curlen == 0 or d.endspace:
+            s = s.lstrip(' ')
+        d.add(s)
+
+
+def decode(raw, extra=()):
+    if raw[:3] == b'\xef\xbb\xbf':
+        return raw[3:].decode('utf-8', 'replace')
+    if raw[:2] in (b'\xff\xfe', b'\xfe\xff'):
+        return raw.decode('utf-16', 'replace')
+    encs = []
+    m = re.search(br'''(?:encoding|charset)\s*=\s*["']?([\w\-]+)''', raw[:1024])
+    if m:
+        encs.append(m.group(1).decode('ascii', 'replace'))
+    encs.append('utf-8')
+    encs.extend(extra)
+    for enc in encs:
+        try:
+            return raw.decode(enc)
+        except (LookupError, UnicodeDecodeError):
+            pass
+    return raw.decode('utf-8', 'replace')
+
+
+# --------------------------------------------------------------------------
+# EPUB
+# --------------------------------------------------------------------------
+def local(tag):
+    return tag.rsplit('}', 1)[-1] if isinstance(tag, str) else ''
+
+
+class NavParser(HTMLParser):
+    """EPUB3 nav 文件 -> 目錄"""
+
+    def __init__(self, base):
+        HTMLParser.__init__(self, convert_charrefs=True)
+        self.base = base
+        self.out = []
+        self.on = 0
+        self.lvl = 0
+        self.href = None
+        self.text = []
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == 'nav':
+            if self.on:
+                self.on += 1
+            elif 'toc' in (a.get('epub:type') or 'toc'):
+                self.on = 1
+                self.lvl = 0
+        elif not self.on:
+            return
+        elif tag == 'ol':
+            self.lvl += 1
+        elif tag == 'a' and a.get('href'):
+            self.href = a['href']
+            self.text = []
+
+    def handle_endtag(self, tag):
+        if not self.on:
+            return
+        if tag == 'nav':
+            self.on -= 1
+        elif tag == 'ol':
+            self.lvl -= 1
+        elif tag == 'a' and self.href:
+            title = ' '.join(''.join(self.text).split())
+            self.out.append((max(0, self.lvl - 1), title, resolve(self.base, self.href)))
+            self.href = None
+
+    def handle_data(self, data):
+        if self.href:
+            self.text.append(data)
+
+
+def ncx_toc(xml, base):
+    out = []
+
+    def walk(e, lvl):
+        for c in e:
+            t = local(c.tag)
+            if t == 'navPoint':
+                label, src = '', None
+                for g in c:
+                    gt = local(g.tag)
+                    if gt == 'navLabel':
+                        label = ' '.join(''.join(g.itertext()).split())
+                    elif gt == 'content':
+                        src = g.get('src')
+                if src:
+                    out.append((lvl, label, resolve(base, src)))
+                walk(c, lvl + 1)
+            elif t == 'navMap':
+                walk(c, lvl)
+
+    walk(ET.fromstring(xml), 0)
+    return out
+
+
+def load_epub(path, doc):
+    z = zipfile.ZipFile(path)
+    names = set(z.namelist())
+    lower = dict((n.lower(), n) for n in names)
+
+    def read(name):
+        if name not in names:
+            name = lower[name.lower()]
+        return z.read(name)
+
+    opf = None
+    for e in ET.fromstring(read('META-INF/container.xml')).iter():
+        if local(e.tag) == 'rootfile':
+            opf = unquote(e.get('full-path') or '')
+            break
+    if not opf:
+        raise ValueError('找不到 OPF')
+    opfdir = posixpath.dirname(opf)
+    manifest, spine, tocid = {}, [], None
+    for e in ET.fromstring(read(opf)).iter():
+        t = local(e.tag)
+        if t == 'item':
+            href = posixpath.normpath(posixpath.join(opfdir, unquote(e.get('href') or '')))
+            manifest[e.get('id')] = (href, e.get('media-type') or '', e.get('properties') or '')
+        elif t == 'itemref':
+            spine.append(e.get('idref'))
+        elif t == 'spine':
+            tocid = e.get('toc')
+        elif t == 'title' and not doc.title:
+            doc.title = ' '.join((e.text or '').split())
+
+    for idref in spine:
+        if idref not in manifest:
+            continue
+        href, mt, _ = manifest[idref]
+        try:
+            raw = read(href)
+        except KeyError:
+            continue
+        doc.start_file(href)
+        if mt.startswith('image/'):
+            doc.add(IMAGE)
+            continue
+        ContentParser(doc, href).run(decode(raw))
+
+    # 目錄：先找 NCX，再找 EPUB3 nav
+    cands = [manifest[tocid]] if tocid in manifest else []
+    cands += [v for v in manifest.values() if v[1] == 'application/x-dtbncx+xml']
+    for href, _, _ in cands:
+        try:
+            doc.rawtoc = ncx_toc(read(href), href)
+        except Exception:
+            continue
+        if doc.rawtoc:
+            return
+    for href, _, props in manifest.values():
+        if 'nav' in props.split():
+            try:
+                p = NavParser(href)
+                p.feed(decode(read(href)))
+                doc.rawtoc = p.out
+            except Exception:
+                pass
+            return
+
+
+# --------------------------------------------------------------------------
+# MOBI / AZW / AZW3 (KF8)
+# --------------------------------------------------------------------------
+NONE = 0xffffffff
+
+
+class MobiError(Exception):
+    pass
+
+
+def palmdoc(data):
+    out = bytearray()
+    i, n = 0, len(data)
+    while i < n:
+        c = data[i]
+        i += 1
+        if c == 0 or 9 <= c < 0x80:
+            out.append(c)
+        elif c <= 8:
+            out += data[i:i + c]
+            i += c
+        elif c >= 0xc0:
+            out.append(32)
+            out.append(c ^ 0x80)
+        elif i < n:
+            c = (c << 8) | data[i]
+            i += 1
+            dist = (c >> 3) & 0x7ff
+            if dist == 0 or dist > len(out):
+                continue
+            for _ in range((c & 7) + 3):
+                out.append(out[-dist])
+    return bytes(out)
+
+
+class Huff(object):
+    """HUFF/CDIC 解壓"""
+
+    def __init__(self, huff, cdics):
+        if huff[:8] != b'HUFF\x00\x00\x00\x18':
+            raise MobiError('HUFF 標頭錯誤')
+        off1, off2 = struct.unpack_from('>LL', huff, 8)
+        self.dict1 = []
+        for v in struct.unpack_from('<256L', huff, off1):
+            codelen, term, maxcode = v & 0x1f, v & 0x80, v >> 8
+            self.dict1.append((codelen, term, ((maxcode + 1) << (32 - codelen)) - 1))
+        d2 = struct.unpack_from('<64L', huff, off2)
+        self.mincode = [0] + [m << (32 - (i + 1)) for i, m in enumerate(d2[0::2])]
+        self.maxcode = [0] + [((m + 1) << (32 - (i + 1))) - 1 for i, m in enumerate(d2[1::2])]
+        self.dictionary = []
+        for cdic in cdics:
+            if cdic[:8] != b'CDIC\x00\x00\x00\x10':
+                raise MobiError('CDIC 標頭錯誤')
+            phrases, bits = struct.unpack_from('>LL', cdic, 8)
+            n = min(1 << bits, phrases - len(self.dictionary))
+            for off in struct.unpack_from('>%dH' % n, cdic, 16):
+                blen, = struct.unpack_from('>H', cdic, 16 + off)
+                self.dictionary.append((cdic[18 + off:18 + off + (blen & 0x7fff)], blen & 0x8000))
+
+    def unpack(self, data):
+        bitsleft = len(data) * 8
+        data += b'\x00' * 8
+        pos = 0
+        x, = struct.unpack_from('>Q', data, pos)
+        n = 32
+        out = []
+        while True:
+            if n <= 0:
+                pos += 4
+                x, = struct.unpack_from('>Q', data, pos)
+                n += 32
+            code = (x >> n) & 0xffffffff
+            codelen, term, maxcode = self.dict1[code >> 24]
+            if not term:
+                while code < self.mincode[codelen]:
+                    codelen += 1
+                maxcode = self.maxcode[codelen]
+            n -= codelen
+            bitsleft -= codelen
+            if bitsleft < 0:
+                break
+            r = (maxcode - code) >> (32 - codelen)
+            sl, flag = self.dictionary[r]
+            if not flag:
+                self.dictionary[r] = (b'', 1)
+                sl = self.unpack(sl)
+                self.dictionary[r] = (sl, 1)
+            out.append(sl)
+        return b''.join(out)
+
+
+def varint(data, pos):
+    val = n = 0
+    while True:
+        b = data[pos + n]
+        n += 1
+        val = (val << 7) | (b & 0x7f)
+        if b & 0x80:
+            return n, val
+
+
+def tagmap(cbc, tags, data, start, end):
+    found = []
+    cbi = 0
+    ds = start + cbc
+    for tag, per, mask, endflag in tags:
+        if endflag == 1:
+            cbi += 1
+            continue
+        value = data[start + cbi] & mask
+        if value:
+            if value == mask:
+                if bin(mask).count('1') > 1:
+                    c, value = varint(data, ds)
+                    ds += c
+                    found.append((tag, None, value, per))
+                else:
+                    found.append((tag, 1, None, per))
+            else:
+                while mask & 1 == 0:
+                    mask >>= 1
+                    value >>= 1
+                found.append((tag, value, None, per))
+    out = {}
+    for tag, count, nbytes, per in found:
+        vals = []
+        if count is not None:
+            for _ in range(count * per):
+                c, v = varint(data, ds)
+                ds += c
+                vals.append(v)
+        else:
+            used = 0
+            while used < nbytes:
+                c, v = varint(data, ds)
+                ds += c
+                used += c
+                vals.append(v)
+        out[tag] = vals
+    return out
+
+
+def inject(raw, marks):
+    """在指定的位元組位置插入標記（避開標籤內部）"""
+    adj = {}
+    for pos in sorted(marks):
+        p = min(max(pos, 0), len(raw))
+        lo = max(0, p - 4096)
+        if raw.rfind(b'<', lo, p) > raw.rfind(b'>', lo, p):
+            p = raw.rfind(b'<', lo, p)
+        adj[p] = adj.get(p, b'') + marks[pos]
+    out = []
+    last = 0
+    for p in sorted(adj):
+        out.append(raw[last:p])
+        out.append(adj[p])
+        last = p
+    out.append(raw[last:])
+    return b''.join(out)
+
+
+class Mobi(object):
+    def __init__(self, data):
+        self.data = data
+        self.n, = struct.unpack_from('>H', data, 76)
+        self.offs = [struct.unpack_from('>L', data, 78 + 8 * i)[0] for i in range(self.n)]
+        self.offs.append(len(data))
+
+    def rec(self, i):
+        return self.data[self.offs[i]:self.offs[i + 1]]
+
+    def index(self, idx):
+        data = self.rec(idx)
+        if data[:4] != b'INDX':
+            raise MobiError('INDX 錯誤')
+        hlen, = struct.unpack_from('>L', data, 4)
+        count, = struct.unpack_from('>L', data, 24)
+        nctoc, = struct.unpack_from('>L', data, 52)
+        ctoc = [self.rec(idx + count + 1 + j) for j in range(nctoc)]
+        cbc, tags = 0, []
+        if data[hlen:hlen + 4] == b'TAGX':
+            first, cbc = struct.unpack_from('>LL', data, hlen + 4)
+            for i in range(12, first, 4):
+                tags.append(tuple(data[hlen + i:hlen + i + 4]))
+        out = []
+        for i in range(idx + 1, idx + 1 + count):
+            d = self.rec(i)
+            start, n = struct.unpack_from('>LL', d, 20)
+            pos = [struct.unpack_from('>H', d, start + 4 + 2 * j)[0] for j in range(n)]
+            pos.append(start)
+            for j in range(n):
+                s, e = pos[j], pos[j + 1]
+                tl = d[s]
+                out.append((d[s + 1:s + 1 + tl], tagmap(cbc, tags, d, s + 1 + tl, e)))
+        return out, ctoc
+
+    def extract(self):
+        """回傳 (標題, html 文字, 目錄)"""
+        h = self.rec(0)
+        comp, _, _, nrec, _, enc = struct.unpack_from('>HHLHHH', h, 0)
+        if enc:
+            raise MobiError('此檔案有 DRM 保護，無法讀取')
+
+        def u32(off):
+            return struct.unpack_from('>L', h, off)[0] if off + 4 <= len(h) else NONE
+
+        ismobi = h[16:20] == b'MOBI'
+        codec, ver, extra, title = 'cp1252', 1, 0, ''
+        if ismobi:
+            hlen = u32(20)
+            ver = u32(36)
+            if u32(28) == 65001:
+                codec = 'utf-8'
+            if hlen >= 0xe4 and len(h) >= 0xf4:
+                extra, = struct.unpack_from('>H', h, 0xf2)
+            toff, tlen = u32(0x54), u32(0x58)
+            if toff != NONE and toff + tlen <= len(h):
+                title = h[toff:toff + tlen].decode(codec, 'replace')
+
+        if comp == 1:
+            dec = bytes
+        elif comp == 2:
+            dec = palmdoc
+        elif comp == 17480 and ismobi:
+            hoff, hnum = u32(0x70), u32(0x74)
+            dec = Huff(self.rec(hoff), [self.rec(hoff + i) for i in range(1, hnum)]).unpack
+        else:
+            raise MobiError('不支援的壓縮格式 %d' % comp)
+
+        trailers = bin(extra >> 1).count('1')
+        parts = []
+        for i in range(1, min(nrec, self.n - 1) + 1):
+            r = self.rec(i)
+            for _ in range(trailers):
+                num = 0
+                for v in r[-4:]:
+                    if v & 0x80:
+                        num = 0
+                    num = (num << 7) | (v & 0x7f)
+                r = r[:max(0, len(r) - num)]
+            if extra & 1 and r:
+                r = r[:max(0, len(r) - ((r[-1] & 3) + 1))]
+            parts.append(dec(r))
+        raw = b''.join(parts)
+
+        marks = {}
+        fragpos = None
+        if ver == 8:
+            try:
+                raw, fragpos, breaks = self.kf8(raw, u32(0xfc), u32(0xf8))
+                for p in breaks:
+                    marks[p] = b'<mbp:pagebreak/>'
+            except Exception:
+                fragpos = None
+                try:
+                    f = self.rec(u32(0xc0))
+                    if f[:4] == b'FDST':
+                        s, e = struct.unpack_from('>LL', f, 12)
+                        raw = raw[s:e]
+                except Exception:
+                    pass
+
+        def mark(pos):
+            marks[pos] = marks.get(pos, b'') + b'<a id="fp%d"></a>' % pos
+
+        # 目錄 (NCX 索引)
+        toc = []
+        ncx = u32(0xf4) if ismobi else NONE
+        if ncx != NONE:
+            try:
+                entries, ctoc = self.index(ncx)
+                for _, tm in entries:
+                    off = tm[3][0]
+                    c = ctoc[off >> 16]
+                    k, ln = varint(c, off & 0xffff)
+                    label = c[(off & 0xffff) + k:(off & 0xffff) + k + ln].decode(codec, 'replace')
+                    if ver == 8:
+                        if fragpos is None or 6 not in tm:
+                            continue
+                        pos = fragpos[tm[6][0]] + tm[6][1]
+                    else:
+                        pos = tm[1][0]
+                    toc.append((pos, tm.get(4, [0])[0], ' '.join(label.split())))
+                toc.sort(key=lambda t: t[0])
+            except Exception:
+                toc = []
+        for pos, _, _ in toc:
+            mark(pos)
+
+        # 連結
+        if ver == 8:
+            link = re.compile(br'kindle:pos:fid:([0-9A-V]{4}):off:([0-9A-V]{10})')
+
+            def target(m):
+                fid = int(m.group(1), 32)
+                if fragpos is None or fid >= len(fragpos):
+                    return None
+                return fragpos[fid] + int(m.group(2), 32)
+
+            def sub(m):
+                t = target(m)
+                return m.group(0) if t is None else b'#fp%d' % t
+        else:
+            link = re.compile(br'''filepos\s*=\s*["']?0*(\d+)["']?''')
+
+            def target(m):
+                return int(m.group(1))
+
+            def sub(m):
+                return b'href="#fp%d"' % int(m.group(1))
+
+        seen = set(marks)
+        for m in link.finditer(raw):
+            t = target(m)
+            if t is not None and t not in seen:
+                seen.add(t)
+                mark(t)
+        for pos, _, _ in toc:
+            seen.add(pos)
+        raw = link.sub(sub, inject(raw, marks))
+        return title, raw.decode(codec, 'replace'), [(lvl, label, '#fp%d' % pos) for pos, lvl, label in toc]
+
+    def kf8(self, raw, skelidx, fragidx):
+        """把 KF8 的骨架與片段組回完整 HTML"""
+        skel, _ = self.index(skelidx)
+        frag, _ = self.index(fragidx)
+        out = bytearray()
+        fragpos, breaks = [], []
+        fi = 0
+        for _, tm in skel:
+            cnt = tm[1][0]
+            spos, slen = tm[6][0], tm[6][1]
+            base = spos + slen
+            s = bytearray(raw[spos:base])
+            for _ in range(cnt):
+                ftext, ftm = frag[fi]
+                fi += 1
+                ins = int(ftext)
+                flen = ftm[6][1]
+                fragpos.append(ins)
+                s[ins - spos:ins - spos] = raw[base:base + flen]
+                base += flen
+            if len(out) < spos:
+                out += b' ' * (spos - len(out))
+            breaks.append(len(out))
+            out += s
+        return bytes(out), fragpos, breaks
+
+
+def load_mobi(path, doc):
+    with open(path, 'rb') as f:
+        data = f.read()
+    doc.title, text, doc.rawtoc = Mobi(data).extract()
+    ContentParser(doc, '').run(text)
+
+
+# --------------------------------------------------------------------------
+# 其他格式與格式判斷
+# --------------------------------------------------------------------------
+def load_text(raw, doc):
+    for line in decode(raw, ('big5', 'gb18030', 'latin-1')).splitlines():
+        line = CTRL.sub('', line.expandtabs(4)).rstrip()
+        if line.strip():
+            doc.add(line)
+            doc.flush('p', 0)
+        else:
+            doc.flush()
+
+
+def load(path):
+    doc = Doc()
+    with open(path, 'rb') as f:
+        head = f.read(2048)
+    ext = os.path.splitext(path)[1].lower()
+    if head[:2] == b'PK':
+        load_epub(path, doc)
+    elif head[60:68] in (b'BOOKMOBI', b'TEXtREAd'):
+        load_mobi(path, doc)
+    else:
+        with open(path, 'rb') as f:
+            raw = f.read()
+        if b'<FictionBook' in head or ext == '.fb2':
+            ContentParser(doc, '', fb2=True).run(decode(raw))
+        elif ext in ('.html', '.htm', '.xhtml') or re.search(br'<html|<!doctype html', head, re.I):
+            ContentParser(doc, '').run(decode(raw))
+        else:
+            load_text(raw, doc)
+    doc.finish()
+    if not doc.title:
+        doc.title = os.path.splitext(os.path.basename(path))[0]
+    return doc
+
+
+# --------------------------------------------------------------------------
+# 閱讀紀錄
+# --------------------------------------------------------------------------
+def state_path():
+    base = os.environ.get('XDG_DATA_HOME') or os.path.join(os.path.expanduser('~'), '.local', 'share')
+    return os.path.join(base, 'yreader', 'history.json')
+
+
+def load_state():
+    try:
+        with open(state_path(), encoding='utf-8') as f:
+            st = json.load(f)
+        if isinstance(st, dict) and isinstance(st.get('books', {}), dict):
+            st.setdefault('books', {})
+            return st
+    except (OSError, ValueError):
+        pass
+    return {'books': {}}
+
+
+def save_state(st):
+    books = st['books']
+    if len(books) > 300:
+        keep = sorted(books, key=lambda k: books[k].get('time', 0))[-300:]
+        st['books'] = dict((k, books[k]) for k in keep)
+    p = state_path()
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        tmp = p + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(st, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
+# 排版
+# --------------------------------------------------------------------------
+BLANK = (-1, 0, 0)
+
+
+def layout(paras, W, H):
+    """回傳 (lines, first)；lines 為 [(段落, 起, 迄)]，first[段落] = 第一行的索引"""
+    lines = []
+    first = [0] * len(paras)
+    prev = None
+    for pi, p in enumerate(paras):
+        if lines:
+            if p.newpage:
+                r = len(lines) % H
+                if r:
+                    lines.extend([BLANK] * (H - r))
+            elif (p.gap or p.style == 'h' or prev.style == 'h') and len(lines) % H:
+                lines.append(BLANK)
+        first[pi] = len(lines)
+        for s, e in wrap(p.text, W):
+            lines.append((pi, s, e))
+        prev = p
+    return lines, first
+
+
+# --------------------------------------------------------------------------
+# 介面
+# --------------------------------------------------------------------------
+HELP = [
+    ('空白 → ↓ PgDn j l', '下一頁'),
+    ('← ↑ PgUp k h', '上一頁'),
+    ('數字 + Enter', '跳到指定頁碼'),
+    ('g / Home', '第一頁'),
+    ('G / End', '最後一頁'),
+    ('[  /  ]', '上一章 / 下一章'),
+    ('t', '目錄'),
+    ('Tab / Shift-Tab', '選取本頁下一個 / 上一個連結'),
+    ('Enter', '開啟選取的連結'),
+    ('Backspace / b', '返回跳轉前的位置'),
+    ('c', '切換文字顏色（白 / 綠 / 藍）'),
+    ('?', '顯示這份說明'),
+    ('q', '離開（自動保存閱讀進度）'),
+]
+
+
+class Reader(object):
+    def __init__(self, scr, curses, doc, pos, color):
+        self.scr = scr
+        self.c = curses
+        self.doc = doc
+        self.ci = COLORS.index(color) if color in COLORS else 0
+        self.page = 0
+        self.sel = None           # 選取中的連結 (段落, 連結索引)
+        self.mark = None          # 連結跳轉後標示的行
+        self.hist = []
+        self.msg = ''
+        self.numbuf = None
+        self.lines = []
+        self.has_color = False
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        try:
+            if curses.has_colors():
+                curses.start_color()
+                try:
+                    curses.use_default_colors()
+                    bg = -1
+                except curses.error:
+                    bg = curses.COLOR_BLACK
+                for i, col in enumerate((curses.COLOR_WHITE, curses.COLOR_GREEN, curses.COLOR_BLUE)):
+                    curses.init_pair(i + 1, col, bg)
+                self.has_color = True
+        except curses.error:
+            pass
+        self.relayout(pos)
+
+    # ---- 位置 ----
+    def attr(self):
+        return self.c.color_pair(self.ci + 1) if self.has_color else 0
+
+    def relayout(self, pos=None):
+        if pos is None:
+            pos = self.position()
+        rows, cols = self.scr.getmaxyx()
+        self.H = max(1, rows - 2)
+        self.W = max(8, min(cols - 4, MAX_WIDTH))
+        self.x0 = max(0, (cols - self.W) // 2)
+        self.lines, self.first = layout(self.doc.paras, self.W, self.H)
+        self.npages = max(1, (len(self.lines) + self.H - 1) // self.H)
+        self.toc_lines = [self.line_of(t) for _, _, t in self.doc.toc]
+        self.page = min(self.line_of(pos) // self.H, self.npages - 1)
+        self.mark = None
+
+    def line_of(self, pos):
+        pi, off = pos
+        if not self.lines:
+            return 0
+        pi = min(max(pi, 0), len(self.first) - 1)
+        i = self.first[pi]
+        n = len(self.lines)
+        while i + 1 < n and self.lines[i + 1][0] == pi and self.lines[i + 1][1] <= off:
+            i += 1
+        return i
+
+    def position(self):
+        base = self.page * self.H
+        for i in range(base, min(base + self.H, len(self.lines))):
+            pi, s, _ = self.lines[i]
+            if pi >= 0:
+                return (pi, s)
+        return (0, 0)
+
+    def set_page(self, n, remember=False):
+        n = min(max(n, 0), self.npages - 1)
+        if n != self.page:
+            if remember:
+                self.hist.append(self.position())
+            self.page = n
+        self.sel = None
+        self.mark = None
+
+    def jump(self, pos, mark=False):
+        self.hist.append(self.position())
+        ln = self.line_of(pos)
+        self.page = min(ln // self.H, self.npages - 1)
+        self.sel = None
+        self.mark = ln if mark else None
+
+    def cur_toc(self):
+        end = (self.page + 1) * self.H
+        cur = -1
+        for i, ln in enumerate(self.toc_lines):
+            if ln < end:
+                cur = i
+        return cur
+
+    # ---- 繪製 ----
+    def put(self, y, x, s, attr=0):
+        rows, cols = self.scr.getmaxyx()
+        if y < 0 or y >= rows or x < 0 or x >= cols:
+            return x
+        s = clip(s, cols - x)
+        try:
+            self.scr.addstr(y, x, s, attr)
+        except self.c.error:
+            pass
+        return x + swidth(s)
+
+    def status(self, left, right=''):
+        rows, cols = self.scr.getmaxyx()
+        a = self.attr() | self.c.A_REVERSE
+        y = rows - 1
+        self.put(y, 0, ' ' * (cols - 1), a)
+        right = clip(right, cols - 2)
+        room = cols - 3 - swidth(right)
+        self.put(y, 1, clip(left, room), a)
+        self.put(y, cols - 1 - swidth(right), right, a)
+
+    def draw(self):
+        c = self.c
+        self.scr.erase()
+        attr = self.attr()
+        paras = self.doc.paras
+        base = self.page * self.H
+        for y in range(self.H):
+            i = base + y
+            if i >= len(self.lines):
+                break
+            pi, s, e = self.lines[i]
+            if pi < 0:
+                continue
+            p = paras[pi]
+            a = attr | (c.A_BOLD if p.style == 'h' else 0)
+            x = self.x0
+            if p.style in ('h', 'hr'):
+                x += max(0, (self.W - swidth(p.text[s:e].rstrip())) // 2)
+            if i == self.mark and self.x0 >= 2:
+                self.put(y, self.x0 - 2, '>', attr | c.A_BOLD)
+            pos = s
+            for k, (ls, le, _) in enumerate(p.links):
+                if le <= pos or ls >= e:
+                    continue
+                st, en = max(ls, pos), min(le, e)
+                if st > pos:
+                    x = self.put(y, x, p.text[pos:st], a)
+                la = a | (c.A_REVERSE if self.sel == (pi, k) else c.A_UNDERLINE)
+                x = self.put(y, x, p.text[st:en], la)
+                pos = en
+            if pos < e:
+                self.put(y, x, p.text[pos:e], a)
+
+        if self.numbuf is not None:
+            self.status('跳到頁碼: %s_   (Enter 確認, Esc 取消)' % self.numbuf,
+                        '共 %d 頁' % self.npages)
+        else:
+            left = self.msg
+            if not left:
+                left = self.doc.title
+                ti = self.cur_toc()
+                if ti >= 0 and self.doc.toc[ti][1] != self.doc.title:
+                    left += ' ─ ' + self.doc.toc[ti][1]
+            pct = 100 * (self.page + 1) // self.npages
+            self.status(left, '%d/%d 頁 %d%%  ?:說明' % (self.page + 1, self.npages, pct))
+        self.msg = ''
+        self.scr.refresh()
+
+    # ---- 輸入 ----
+    def getkey(self):
+        try:
+            return self.scr.get_wch()
+        except AttributeError:
+            k = self.scr.getch()
+            return chr(k) if 0 <= k < 256 else k
+        except self.c.error:
+            return None
+
+    def is_enter(self, k):
+        return k in ('\n', '\r', self.c.KEY_ENTER)
+
+    def is_back(self, k):
+        return k in (self.c.KEY_BACKSPACE, '\x7f', '\x08')
+
+    # ---- 連結 ----
+    def page_links(self):
+        out = []
+        base = self.page * self.H
+        for i in range(base, min(base + self.H, len(self.lines))):
+            pi, s, e = self.lines[i]
+            if pi < 0:
+                continue
+            for k, (ls, le, _) in enumerate(self.doc.paras[pi].links):
+                if ls < e and le > s and (pi, k) not in out:
+                    out.append((pi, k))
+        return out
+
+    def cycle_link(self, step):
+        links = self.page_links()
+        if not links:
+            self.msg = '本頁沒有連結'
+            return
+        if self.sel in links:
+            self.sel = links[(links.index(self.sel) + step) % len(links)]
+        else:
+            self.sel = links[0 if step > 0 else -1]
+
+    def follow(self):
+        if self.sel is None:
+            self.cycle_link(1)
+            return
+        pi, k = self.sel
+        href = self.doc.paras[pi].links[k][2]
+        if SCHEME.match(href):
+            self.msg = '外部連結: ' + href
+            return
+        t = self.doc.lookup(href)
+        if t is None:
+            self.msg = '找不到連結目標: ' + href
+            return
+        self.jump(t, mark=True)
+
+    def back(self):
+        if not self.hist:
+            self.msg = '沒有可返回的位置'
+            return
+        pos = self.hist.pop()
+        self.page = min(self.line_of(pos) // self.H, self.npages - 1)
+        self.sel = None
+        self.mark = None
+
+    def chapter(self, step):
+        pages = sorted(set(ln // self.H for ln in self.toc_lines))
+        if step > 0:
+            nxt = [p for p in pages if p > self.page]
+        else:
+            nxt = [p for p in reversed(pages) if p < self.page]
+        if nxt:
+            self.set_page(nxt[0], remember=True)
+        else:
+            self.msg = '沒有下一章' if step > 0 else '沒有上一章'
+
+    # ---- 目錄 / 說明 ----
+    def toc_view(self):
+        c = self.c
+        toc = self.doc.toc
+        if not toc:
+            self.msg = '這本書沒有目錄'
+            return
+        cur = max(self.cur_toc(), 0)
+        while True:
+            rows, cols = self.scr.getmaxyx()
+            h = max(1, rows - 2)
+            w = max(8, min(cols - 4, MAX_WIDTH))
+            x0 = max(0, (cols - w) // 2)
+            top = min(max(0, cur - h // 2), max(0, len(toc) - h))
+            attr = self.attr()
+            self.scr.erase()
+            self.put(0, x0, '目錄', attr | c.A_BOLD)
+            for y in range(h):
+                i = top + y
+                if i >= len(toc):
+                    break
+                lvl, title, _ = toc[i]
+                pg = str(self.toc_lines[i] // self.H + 1)
+                row = clip('  ' * min(lvl, 8) + title, w - len(pg) - 2)
+                row += ' ' * (w - len(pg) - swidth(row)) + pg
+                self.put(1 + y, x0, row, attr | (c.A_REVERSE if i == cur else 0))
+            self.status('↑↓ 選擇   Enter 前往   t / Esc 關閉', '%d/%d' % (cur + 1, len(toc)))
+            self.scr.refresh()
+            k = self.getkey()
+            if k == c.KEY_RESIZE:
+                self.relayout()
+            elif k in (c.KEY_DOWN, 'j'):
+                cur = min(cur + 1, len(toc) - 1)
+            elif k in (c.KEY_UP, 'k'):
+                cur = max(cur - 1, 0)
+            elif k in (c.KEY_NPAGE, ' '):
+                cur = min(cur + h, len(toc) - 1)
+            elif k == c.KEY_PPAGE:
+                cur = max(cur - h, 0)
+            elif k in (c.KEY_HOME, 'g'):
+                cur = 0
+            elif k in (c.KEY_END, 'G'):
+                cur = len(toc) - 1
+            elif self.is_enter(k) or k in (c.KEY_RIGHT, 'l'):
+                self.jump(toc[cur][2])
+                return
+            elif k in ('t', 'q', '\x1b', c.KEY_LEFT, 'h'):
+                return
+
+    def help_view(self):
+        c = self.c
+        while True:
+            rows, cols = self.scr.getmaxyx()
+            attr = self.attr()
+            self.scr.erase()
+            self.put(0, 2, 'yreader %s 按鍵說明' % VERSION, attr | c.A_BOLD)
+            for i, (keys, desc) in enumerate(HELP):
+                self.put(2 + i, 2, keys, attr | c.A_BOLD)
+                self.put(2 + i, 24, desc, attr)
+            self.status('按任意鍵返回')
+            self.scr.refresh()
+            k = self.getkey()
+            if k == c.KEY_RESIZE:
+                self.relayout()
+            elif k is not None:
+                return
+
+    # ---- 主迴圈 ----
+    def loop(self):
+        c = self.c
+        nxt = {' ', 'j', 'l', 'n', 'f', c.KEY_DOWN, c.KEY_RIGHT, c.KEY_NPAGE}
+        prv = {'k', 'h', 'p', c.KEY_UP, c.KEY_LEFT, c.KEY_PPAGE}
+        while True:
+            self.draw()
+            k = self.getkey()
+            if k is None:
+                continue
+            if k == c.KEY_RESIZE:
+                self.relayout()
+                continue
+            if self.numbuf is not None:
+                if isinstance(k, str) and k.isascii() and k.isdigit():
+                    if len(self.numbuf) < 9:
+                        self.numbuf += k
+                elif self.is_back(k):
+                    self.numbuf = self.numbuf[:-1] or None
+                else:
+                    if self.is_enter(k):
+                        n = int(self.numbuf)
+                        if 1 <= n <= self.npages:
+                            self.set_page(n - 1, remember=True)
+                        else:
+                            self.msg = '頁碼超出範圍 (1-%d)' % self.npages
+                    self.numbuf = None
+                continue
+            if isinstance(k, str) and k.isascii() and k.isdigit():
+                self.numbuf = k
+            elif k in nxt:
+                if self.page >= self.npages - 1:
+                    self.msg = '已經是最後一頁'
+                self.set_page(self.page + 1)
+            elif k in prv:
+                if self.page == 0:
+                    self.msg = '已經是第一頁'
+                self.set_page(self.page - 1)
+            elif k in ('g', c.KEY_HOME):
+                self.set_page(0, remember=True)
+            elif k in ('G', c.KEY_END):
+                self.set_page(self.npages - 1, remember=True)
+            elif k == ']':
+                self.chapter(1)
+            elif k == '[':
+                self.chapter(-1)
+            elif k == '\t':
+                self.cycle_link(1)
+            elif k == c.KEY_BTAB:
+                self.cycle_link(-1)
+            elif self.is_enter(k):
+                self.follow()
+            elif self.is_back(k) or k == 'b':
+                self.back()
+            elif k == 't':
+                self.toc_view()
+            elif k == 'c':
+                self.ci = (self.ci + 1) % len(COLORS)
+                self.msg = '文字顏色: ' + COLOR_NAMES[COLORS[self.ci]]
+            elif k == '?':
+                self.help_view()
+            elif k == '\x1b':
+                self.sel = None
+            elif k in ('q', 'Q'):
+                return
+
+
+# --------------------------------------------------------------------------
+# 主程式
+# --------------------------------------------------------------------------
+def dump(doc):
+    out = []
+    for i, p in enumerate(doc.paras):
+        if i and (p.gap or p.newpage or p.style == 'h'):
+            out.append('')
+        out.append(p.text)
+    try:
+        sys.stdout.write('\n'.join(out) + '\n')
+    except BrokenPipeError:
+        pass
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog='yreader',
+        description='輕量終端機電子書閱讀器 (epub / mobi / azw3 / fb2 / html / txt)',
+        epilog='不帶檔名執行時會開啟上次閱讀的書。閱讀中按 ? 顯示按鍵說明。')
+    ap.add_argument('file', nargs='?', help='電子書檔案')
+    ap.add_argument('-c', '--color', choices=COLORS, help='文字顏色 (預設沿用上次的設定)')
+    ap.add_argument('--dump', action='store_true', help='輸出純文字後離開')
+    ap.add_argument('-V', '--version', action='version', version='yreader ' + VERSION)
+    args = ap.parse_args()
+
+    try:
+        locale.setlocale(locale.LC_ALL, '')
+    except locale.Error:
+        pass
+    state = load_state()
+    books = state['books']
+    path = args.file
+    if not path:
+        recent = sorted(books, key=lambda k: books[k].get('time', 0), reverse=True)
+        path = next((p for p in recent if os.path.isfile(p)), None)
+        if not path:
+            ap.print_usage(sys.stderr)
+            return 2
+    if not os.path.isfile(path):
+        sys.stderr.write('yreader: 找不到檔案: %s\n' % path)
+        return 1
+    try:
+        doc = load(path)
+    except Exception as e:
+        sys.stderr.write('yreader: 無法讀取 %s: %s\n' % (path, e or type(e).__name__))
+        return 1
+
+    if args.dump or not sys.stdout.isatty():
+        dump(doc)
+        return 0
+
+    os.environ.setdefault('ESCDELAY', '25')
+    import curses
+    key = os.path.realpath(path)
+    saved = books.get(key, {})
+    pos = (int(saved.get('para', 0)), int(saved.get('off', 0)))
+    color = args.color or state.get('color') or 'white'
+
+    def bye(*_):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGHUP, bye)
+
+    def run(scr):
+        r = Reader(scr, curses, doc, pos, color)
+        try:
+            r.loop()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            pi, off = r.position()
+            books[key] = {'para': pi, 'off': off, 'title': doc.title, 'time': int(time.time())}
+            state['color'] = COLORS[r.ci]
+            save_state(state)
+
+    curses.wrapper(run)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
