@@ -6,11 +6,31 @@
 
 ## 安裝
 
+直接下載單一檔案到 `~/.local/bin`：
+
 ```bash
-install -m 755 yreader ~/.local/bin/yreader
+mkdir -p ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/L1amaY0796/yreader/main/yreader -o ~/.local/bin/yreader
+chmod +x ~/.local/bin/yreader
 ```
 
-（或 `sudo install -m 755 yreader /usr/local/bin/yreader`）
+或用 git：
+
+```bash
+git clone https://github.com/L1amaY0796/yreader.git
+cd yreader
+install -D -m 755 yreader ~/.local/bin/yreader
+```
+
+想裝給所有使用者，把目的地改成 `/usr/local/bin/yreader`（需要 `sudo`）。
+
+如果執行 `yreader` 時找不到指令，代表 `~/.local/bin` 不在 `PATH` 裡，把這行加進 `~/.bashrc`：
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+更新時重跑一次上面的安裝指令即可；移除則是 `rm ~/.local/bin/yreader`。
 
 ## 使用
 
