@@ -22,7 +22,7 @@ import zipfile
 from html.parser import HTMLParser
 from urllib.parse import unquote
 
-VERSION = '1.1'
+VERSION = '1.2'
 COLORS = ['white', 'green', 'blue']
 MAX_WIDTH = 100          # 內文最大欄寬
 IMAGE = '<image>'
@@ -76,8 +76,22 @@ STR = {
         'toc_hint': '↑↓ 選擇   Enter 前往   t / Esc 關閉',
         'help_title': 'yreader %s 按鍵說明',
         'anykey': '按任意鍵返回',
+        'help_more': '按任意鍵看下一頁（q 返回）',
         'color': '文字顏色: %s',
         'white': '白', 'green': '綠', 'blue': '藍',
+        'arg_width': '內文最大欄寬（會記住）',
+        'search_prompt': '搜尋: ',
+        'prompt_hint': 'Enter 確認  Esc 取消',
+        'not_found': '找不到「%s」',
+        'search_status': '搜尋「%s」 %d/%d  n/N:下/上一個  Enter:留下  Esc:返回',
+        'wrap_start': '已繞回第一個結果',
+        'wrap_end': '已繞到最後一個結果',
+        'no_search': '尚未搜尋（按 / 開始）',
+        'width': '欄寬: %d',
+        'pgap_on': '段落間距: 開',
+        'pgap_off': '段落間距: 關（改用首行縮排）',
+        'lsp1': '行距: 單行',
+        'lsp2': '行距: 雙行',
     },
     'en': {
         'desc': 'A lightweight terminal ebook reader (epub / mobi / azw3 / fb2 / html / txt)',
@@ -113,8 +127,22 @@ STR = {
         'toc_hint': 'Up/Down: select   Enter: go   t / Esc: close',
         'help_title': 'yreader %s key bindings',
         'anykey': 'Press any key to return',
+        'help_more': 'Press any key for more (q to return)',
         'color': 'Text color: %s',
         'white': 'white', 'green': 'green', 'blue': 'blue',
+        'arg_width': 'maximum text width in columns (remembered)',
+        'search_prompt': 'Search: ',
+        'prompt_hint': 'Enter: ok  Esc: cancel',
+        'not_found': 'Not found: %s',
+        'search_status': 'Search "%s" %d/%d  n/N:next  Enter:stay  Esc:back',
+        'wrap_start': 'Wrapped to the first match',
+        'wrap_end': 'Wrapped to the last match',
+        'no_search': 'No active search (press / to search)',
+        'width': 'Text width: %d',
+        'pgap_on': 'Paragraph spacing: on',
+        'pgap_off': 'Paragraph spacing: off (first-line indent)',
+        'lsp1': 'Line spacing: single',
+        'lsp2': 'Line spacing: double',
     },
 }
 HELP = {
@@ -129,6 +157,12 @@ HELP = {
         ('Tab / Shift-Tab', '選取本頁下一個 / 上一個連結'),
         ('Enter', '開啟選取的連結'),
         ('Backspace / b', '返回跳轉前的位置'),
+        ('/', '搜尋'),
+        ('n / N', '下一個 / 上一個搜尋結果'),
+        ('Esc', '結束搜尋並回到搜尋前的頁面'),
+        ('-  /  +', '縮小 / 加大欄寬'),
+        ('s', '段落間距 開 / 關'),
+        ('d', '行距 單行 / 雙行'),
         ('c', '切換文字顏色（白 / 綠 / 藍）'),
         ('L', '切換介面語言（中文 / English）'),
         ('?', '顯示這份說明'),
@@ -145,6 +179,12 @@ HELP = {
         ('Tab / Shift-Tab', 'Select next / previous link'),
         ('Enter', 'Follow the selected link'),
         ('Backspace / b', 'Go back to where you were'),
+        ('/', 'Search'),
+        ('n / N', 'Next / previous match'),
+        ('Esc', 'End search and return to where it started'),
+        ('-  /  +', 'Narrower / wider text'),
+        ('s', 'Paragraph spacing on / off'),
+        ('d', 'Line spacing single / double'),
         ('c', 'Text color: white / green / blue'),
         ('L', 'Language: Chinese / English'),
         ('?', 'Show this help'),
@@ -205,11 +245,12 @@ def clip(s, w):
     return s
 
 
-def wrap(text, width):
-    """回傳 [(start, end)]，每段的顯示寬度不超過 width"""
+def wrap(text, width, indent=0):
+    """回傳 [(start, end)]，每段的顯示寬度不超過 width（第一行少 indent 欄）"""
     out = []
     n = len(text)
     i = 0
+    lim = max(1, width - indent)
     while i < n:
         w = 0
         j = i
@@ -217,7 +258,7 @@ def wrap(text, width):
         while j < n:
             ch = text[j]
             cw = cwidth(ch)
-            if w + cw > width:
+            if w + cw > lim:
                 break
             w += cw
             j += 1
@@ -246,6 +287,7 @@ def wrap(text, width):
             e -= 1
         out.append((i, e))
         i = e
+        lim = width
         while i < n and text[i] == ' ':
             i += 1
     return out
@@ -1184,7 +1226,12 @@ def save_state(st):
 BLANK = (-1, 0, 0)
 
 
-def layout(paras, W, H):
+def para_indent(p, pgap):
+    """關閉段落間距時，一般段落改用首行縮排來區分"""
+    return 2 if (not pgap and p.style == 'p' and p.gap and not p.text[:1].isspace()) else 0
+
+
+def layout(paras, W, H, pgap=True, lsp=1):
     """回傳 (lines, first)；lines 為 [(段落, 起, 迄)]，first[段落] = 第一行的索引"""
     lines = []
     first = [0] * len(paras)
@@ -1195,16 +1242,20 @@ def layout(paras, W, H):
                 r = len(lines) % H
                 if r:
                     lines.extend([BLANK] * (H - r))
-            elif (p.gap or p.style == 'h' or prev.style == 'h') and len(lines) % H:
+            elif ((p.gap and (pgap or p.style != prev.style)) or p.style == 'h' or prev.style == 'h') \
+                    and len(lines) % H:
                 lines.append(BLANK)
-        segs = wrap(p.text, W)
+        segs = wrap(p.text, W, para_indent(p, pgap))
         if p.style == 'h':            # 標題不要孤零零留在頁尾
             r = len(lines) % H
-            if r and len(segs) + 2 <= H and H - r < len(segs) + 2:
+            need = len(segs) * lsp + 2
+            if r and need <= H and H - r < need:
                 lines.extend([BLANK] * (H - r))
         first[pi] = len(lines)
         for s, e in segs:
             lines.append((pi, s, e))
+            if lsp > 1 and len(lines) % H:
+                lines.append(BLANK)
         prev = p
     return lines, first
 
@@ -1213,7 +1264,7 @@ def layout(paras, W, H):
 # 介面
 # --------------------------------------------------------------------------
 class Reader(object):
-    def __init__(self, scr, curses, doc, pos, color):
+    def __init__(self, scr, curses, doc, pos, color, maxw=MAX_WIDTH, pgap=True, lsp=1):
         self.scr = scr
         self.c = curses
         self.doc = doc
@@ -1225,6 +1276,15 @@ class Reader(object):
         self.msg = ''
         self.numbuf = None
         self.lines = []
+        self.maxw = maxw          # 版面：最大欄寬 / 段落間距 / 行距
+        self.pgap = pgap
+        self.lsp = lsp
+        self.query = ''           # 搜尋
+        self.lastq = ''
+        self.matches = []         # [(段落, 起, 迄)]
+        self.bypara = {}          # 段落 -> [(起, 迄, 第幾個結果)]
+        self.mi = 0
+        self.origin = None        # 搜尋前的位置
         self.has_color = False
         try:
             curses.curs_set(0)
@@ -1254,9 +1314,9 @@ class Reader(object):
             pos = self.position()
         rows, cols = self.scr.getmaxyx()
         self.H = max(1, rows - 2)
-        self.W = max(8, min(cols - 4, MAX_WIDTH))
+        self.W = max(8, min(cols - 4, self.maxw))
         self.x0 = max(0, (cols - self.W) // 2)
-        self.lines, self.first = layout(self.doc.paras, self.W, self.H)
+        self.lines, self.first = layout(self.doc.paras, self.W, self.H, self.pgap, self.lsp)
         self.npages = max(1, (len(self.lines) + self.H - 1) // self.H)
         self.toc_lines = [self.line_of(t) for _, _, t in self.doc.toc]
         self.page = min(self.line_of(pos) // self.H, self.npages - 1)
@@ -1339,6 +1399,10 @@ class Reader(object):
         attr = self.attr()
         paras = self.doc.paras
         base = self.page * self.H
+        mark = self.mark
+        if self.matches:
+            m = self.matches[self.mi]
+            mark = self.line_of((m[0], m[1]))
         for y in range(self.H):
             i = base + y
             if i >= len(self.lines):
@@ -1351,32 +1415,44 @@ class Reader(object):
             x = self.x0
             if p.style in ('h', 'hr'):
                 x += max(0, (self.W - swidth(p.text[s:e].rstrip())) // 2)
-            if i == self.mark and self.x0 >= 2:
+            elif s == 0:
+                x += para_indent(p, self.pgap)
+            if i == mark and self.x0 >= 2:
                 self.put(y, self.x0 - 2, '>', attr | c.A_BOLD)
-            pos = s
+            spans = []                # (起, 迄, 額外屬性)：連結加底線，搜尋結果反白
             for k, (ls, le, _) in enumerate(p.links):
-                if le <= pos or ls >= e:
-                    continue
-                st, en = max(ls, pos), min(le, e)
-                if st > pos:
-                    x = self.put(y, x, p.text[pos:st], a)
-                la = a | (c.A_REVERSE if self.sel == (pi, k) else c.A_UNDERLINE)
-                x = self.put(y, x, p.text[st:en], la)
-                pos = en
-            if pos < e:
-                self.put(y, x, p.text[pos:e], a)
+                if ls < e and le > s:
+                    spans.append((ls, le, c.A_REVERSE if self.sel == (pi, k) else c.A_UNDERLINE))
+            for ms, me, idx in self.bypara.get(pi, ()):
+                if ms < e and me > s:
+                    spans.append((ms, me, c.A_REVERSE | (c.A_BOLD if idx == self.mi else 0)))
+            if not spans:
+                self.put(y, x, p.text[s:e], a)
+                continue
+            cuts = sorted(set([s, e] + [min(max(v, s), e) for sp in spans for v in sp[:2]]))
+            for st, en in zip(cuts, cuts[1:]):
+                sa = a
+                for ss, se, extra in spans:
+                    if ss <= st and en <= se:
+                        sa |= extra
+                x = self.put(y, x, p.text[st:en], sa)
 
         if self.numbuf is not None:
             self.status(T('goto', self.numbuf), T('total', self.npages))
         else:
             left = self.msg
-            if not left:
+            if not left and self.matches:
+                left = T('search_status', self.query, self.mi + 1, len(self.matches))
+            elif not left:
                 left = self.doc.title
                 ti = self.cur_toc()
                 if ti >= 0 and self.doc.toc[ti][1] != self.doc.title:
                     left += ' ─ ' + self.doc.toc[ti][1]
-            pct = 100 * (self.page + 1) // self.npages
-            self.status(left, T('status', self.page + 1, self.npages, pct))
+            if self.matches:          # 搜尋中：右側只留頁碼，把空間讓給提示
+                right = '%d/%d' % (self.page + 1, self.npages)
+            else:
+                right = T('status', self.page + 1, self.npages, 100 * (self.page + 1) // self.npages)
+            self.status(left, right)
         self.msg = ''
         self.scr.refresh()
 
@@ -1454,6 +1530,108 @@ class Reader(object):
         else:
             self.msg = T('no_next' if step > 0 else 'no_prev')
 
+    # ---- 搜尋 ----
+    def prompt(self, label):
+        """在狀態列輸入一行文字；Esc 取消時回傳 None"""
+        c = self.c
+        buf = ''
+        hint = T('prompt_hint')
+        while True:
+            self.draw()
+            cols = self.scr.getmaxyx()[1]
+            text = label + buf + '_'
+            room = cols - 4 - swidth(hint)
+            while len(text) > 1 and swidth(text) > room:
+                text = text[1:]
+            self.status(text, hint)
+            self.scr.refresh()
+            k = self.getkey()
+            if k == c.KEY_RESIZE:
+                self.relayout()
+            elif self.is_enter(k):
+                return buf
+            elif k == '\x1b':
+                return None
+            elif self.is_back(k):
+                if not buf:
+                    return None
+                buf = buf[:-1]
+            elif k == '\x15':             # Ctrl-U 清空
+                buf = ''
+            elif isinstance(k, str) and k >= ' ':
+                buf += k
+
+    def search(self):
+        q = self.prompt(T('search_prompt'))
+        if q is None:
+            return
+        q = norm(q) or self.lastq         # 直接按 Enter：重複上次的搜尋
+        if not q:
+            return
+        self.lastq = q
+        rx = re.compile(re.escape(q), re.IGNORECASE)
+        matches, bypara = [], {}
+        for pi, p in enumerate(self.doc.paras):
+            for m in rx.finditer(p.text):
+                bypara.setdefault(pi, []).append((m.start(), m.end(), len(matches)))
+                matches.append((pi, m.start(), m.end()))
+        if not matches:
+            self.msg = T('not_found', q)
+            return
+        if not self.matches:              # 連續搜尋時保留最初的位置
+            self.origin = self.position()
+        self.query, self.matches, self.bypara = q, matches, bypara
+        start = self.page * self.H
+        self.mi = 0
+        for i, m in enumerate(matches):   # 從目前這一頁開始往後找
+            if self.line_of((m[0], m[1])) >= start:
+                self.mi = i
+                break
+        else:
+            self.msg = T('wrap_start')
+        self.show_match()
+
+    def show_match(self):
+        m = self.matches[self.mi]
+        self.page = min(self.line_of((m[0], m[1])) // self.H, self.npages - 1)
+        self.sel = None
+        self.mark = None
+
+    def next_match(self, step):
+        if not self.matches:
+            self.msg = T('no_search')
+            return
+        i = self.mi + step
+        if i >= len(self.matches):
+            self.msg = T('wrap_start')
+        elif i < 0:
+            self.msg = T('wrap_end')
+        self.mi = i % len(self.matches)
+        self.show_match()
+
+    def end_search(self, back):
+        """結束搜尋；back=True 時回到搜尋前的頁面"""
+        if not self.matches:
+            return False
+        origin = self.origin
+        self.query, self.matches, self.bypara, self.origin = '', [], {}, None
+        if origin is not None:
+            if back:
+                self.page = min(self.line_of(origin) // self.H, self.npages - 1)
+            elif self.line_of(origin) // self.H != self.page:
+                self.hist.append(origin)      # 留在此頁時，Backspace 仍可回去
+        self.sel = None
+        self.mark = None
+        return True
+
+    # ---- 版面 ----
+    def set_width(self, step):
+        cols = self.scr.getmaxyx()[1]
+        room = max(20, cols - 4)
+        self.maxw = min(max(min(self.maxw, room) + step, 20), room)
+        self.relayout()
+        self.msg = T('width', self.W)
+
     # ---- 目錄 / 說明 ----
     def toc_view(self):
         c = self.c
@@ -1505,30 +1683,36 @@ class Reader(object):
 
     def help_view(self):
         c = self.c
+        top = 0
         while True:
             rows, cols = self.scr.getmaxyx()
             attr = self.attr()
+            table = HELP[LANG]
+            h = max(1, rows - 3)
+            top = min(top, max(0, len(table) - 1))
             self.scr.erase()
             self.put(0, 2, T('help_title', VERSION), attr | c.A_BOLD)
-            table = HELP[LANG]
             col = 4 + max(swidth(keys) for keys, _ in table)
-            for i, (keys, desc) in enumerate(table):
+            for i, (keys, desc) in enumerate(table[top:top + h]):
                 self.put(2 + i, 2, keys, attr | c.A_BOLD)
                 self.put(2 + i, col, desc, attr)
-            self.status(T('anykey'))
+            more = top + h < len(table)       # 視窗太矮時分頁顯示
+            self.status(T('help_more' if more else 'anykey'))
             self.scr.refresh()
             k = self.getkey()
             if k == c.KEY_RESIZE:
                 self.relayout()
             elif k is not None:
-                return
+                if not more or k in ('q', '\x1b'):
+                    return
+                top += h
 
     # ---- 主迴圈 ----
     def loop(self):
         global LANG, CHOSEN
         c = self.c
-        nxt = {' ', 'j', 'l', 'n', 'f', c.KEY_DOWN, c.KEY_RIGHT, c.KEY_NPAGE}
-        prv = {'k', 'h', 'p', c.KEY_UP, c.KEY_LEFT, c.KEY_PPAGE}
+        nxt = {' ', 'j', 'l', c.KEY_DOWN, c.KEY_RIGHT, c.KEY_NPAGE}
+        prv = {'k', 'h', c.KEY_UP, c.KEY_LEFT, c.KEY_PPAGE}
         while True:
             self.draw()
             k = self.getkey()
@@ -1575,7 +1759,28 @@ class Reader(object):
             elif k == c.KEY_BTAB:
                 self.cycle_link(-1)
             elif self.is_enter(k):
-                self.follow()
+                if self.sel is None and self.matches:
+                    self.end_search(False)
+                else:
+                    self.follow()
+            elif k == '/':
+                self.search()
+            elif k == 'n':
+                self.next_match(1)
+            elif k == 'N':
+                self.next_match(-1)
+            elif k in ('-', '_'):
+                self.set_width(-4)
+            elif k in ('+', '='):
+                self.set_width(4)
+            elif k == 's':
+                self.pgap = not self.pgap
+                self.relayout()
+                self.msg = T('pgap_on' if self.pgap else 'pgap_off')
+            elif k == 'd':
+                self.lsp = 2 if self.lsp == 1 else 1
+                self.relayout()
+                self.msg = T('lsp%d' % self.lsp)
             elif self.is_back(k) or k == 'b':
                 self.back()
             elif k == 't':
@@ -1589,7 +1794,8 @@ class Reader(object):
             elif k == '?':
                 self.help_view()
             elif k == '\x1b':
-                self.sel = None
+                if not self.end_search(True):
+                    self.sel = None
             elif k in ('q', 'Q'):
                 return
 
@@ -1656,6 +1862,7 @@ def main():
     ap = argparse.ArgumentParser(prog='yreader', description=T('desc'), epilog=T('epilog'))
     ap.add_argument('file', nargs='?', help=T('arg_file'))
     ap.add_argument('-c', '--color', choices=COLORS, help=T('arg_color'))
+    ap.add_argument('-w', '--width', type=int, metavar='N', help=T('arg_width'))
     ap.add_argument('-l', '--lang', choices=LANGS, help=T('arg_lang'))
     ap.add_argument('-e', '--encoding', metavar='ENC', help=T('arg_enc'))
     ap.add_argument('--dump', action='store_true', help=T('arg_dump'))
@@ -1715,6 +1922,12 @@ def main():
     except (TypeError, ValueError):
         pos = (0, 0)
     color = args.color or state.get('color') or 'white'
+    try:
+        maxw = min(max(int(args.width or state.get('width') or MAX_WIDTH), 20), 400)
+    except (TypeError, ValueError):
+        maxw = MAX_WIDTH
+    pgap = state.get('pgap', True) is not False
+    lsp = 2 if state.get('lsp') == 2 else 1
 
     def bye(*_):
         raise SystemExit(0)
@@ -1723,7 +1936,7 @@ def main():
     signal.signal(signal.SIGHUP, bye)
 
     def run(scr):
-        r = Reader(scr, curses, doc, pos, color)
+        r = Reader(scr, curses, doc, pos, color, maxw, pgap, lsp)
         try:
             r.loop()
         except KeyboardInterrupt:
@@ -1734,6 +1947,7 @@ def main():
             if FORCE_ENC:
                 books[key]['enc'] = FORCE_ENC
             state['color'] = COLORS[r.ci]
+            state['width'], state['pgap'], state['lsp'] = r.maxw, r.pgap, r.lsp
             if CHOSEN:
                 state['lang'] = CHOSEN
             save_state(state)

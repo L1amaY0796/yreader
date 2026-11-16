@@ -44,6 +44,7 @@ yreader ebook.epub
 
 - `yreader`（不帶檔名）：開啟上次閱讀的書
 - `yreader -c green ebook.epub`：指定文字顏色（white / green / blue）
+- `yreader -w 60 ebook.epub`：指定內文最大欄寬
 - `yreader --lang en`：切換介面語言（zh / en）
 - `yreader -e big5 old.txt`：強制指定文字編碼
 - `yreader --dump ebook.epub`：輸出純文字
@@ -61,12 +62,37 @@ yreader ebook.epub
 | Tab / Shift-Tab | 選取本頁的下一個 / 上一個連結 |
 | Enter | 開啟選取的連結（註解、內文連結） |
 | Backspace / b | 返回跳轉前的位置 |
+| / | 搜尋 |
+| n / N | 下一個 / 上一個搜尋結果 |
+| Esc | 結束搜尋並回到搜尋前的頁面 |
+| - / + | 縮小 / 加大欄寬 |
+| s | 段落間距 開 / 關 |
+| d | 行距 單行 / 雙行 |
 | c | 切換文字顏色（白 / 綠 / 藍） |
 | L | 切換介面語言（中文 / English） |
 | ? | 按鍵說明 |
 | q | 離開 |
 
 圖片一律顯示為 `<image>`。
+
+### 搜尋
+
+按 `/` 輸入關鍵字後按 Enter，會跳到目前頁面之後的第一個結果，所有符合的文字都會反白（不分大小寫）。
+
+- `n` / `N`：下一個 / 上一個結果
+- `Esc`：結束搜尋，直接回到搜尋前停留的頁面
+- `Enter`：結束搜尋但留在目前這頁（之後仍可用 Backspace 回去）
+- `/` 後直接按 Enter：重複上一次的搜尋
+
+### 版面
+
+終端機程式無法改變字的大小（那是終端機的字型設定，通常是 `Ctrl` + `+` / `-`），但可以調整版面：
+
+- `-` / `+`：縮小 / 加大內文欄寬（也可用 `yreader -w 60` 指定）
+- `s`：段落之間是否空一行；關閉時改用首行縮排，一頁能放更多字
+- `d`：單行 / 雙行行距
+
+這些設定會記住，下次開啟時沿用。
 
 ### 介面語言
 
@@ -84,7 +110,7 @@ yreader ebook.epub
 
 ### 閱讀紀錄
 
-離開時自動保存每本書的閱讀位置、顏色與語言設定，存放在 `~/.local/share/yreader/history.json`
+離開時自動保存每本書的閱讀位置，以及顏色、語言與版面設定，存放在 `~/.local/share/yreader/history.json`
 （或 `$XDG_DATA_HOME/yreader/`）。位置以段落記錄，改變終端機視窗大小後仍會回到同一處。
 
 ## English
@@ -121,6 +147,7 @@ yreader ebook.epub
 
 - `yreader` (no file): reopen the last book
 - `yreader -c green ebook.epub`: text color (white / green / blue)
+- `yreader -w 60 ebook.epub`: maximum text width
 - `yreader --lang zh`: change the interface language (zh / en)
 - `yreader -e cp1251 old.txt`: force a text encoding
 - `yreader --dump ebook.epub`: print plain text
@@ -138,12 +165,37 @@ yreader ebook.epub
 | Tab / Shift-Tab | Select next / previous link on the page |
 | Enter | Follow the selected link (footnotes, cross-references) |
 | Backspace / b | Go back to where you were |
+| / | Search |
+| n / N | Next / previous match |
+| Esc | End the search and return to the page where it started |
+| - / + | Narrower / wider text |
+| s | Paragraph spacing on / off |
+| d | Line spacing single / double |
 | c | Cycle text color (white / green / blue) |
 | L | Switch interface language |
 | ? | Help |
 | q | Quit |
 
 Images are shown as `<image>`.
+
+### Search
+
+Press `/`, type some text and press Enter. It jumps to the first match from the current page onward and highlights every match (case-insensitive).
+
+- `n` / `N`: next / previous match
+- `Esc`: end the search and jump straight back to the page you were on before searching
+- `Enter`: end the search but stay on the current page (Backspace still takes you back)
+- `/` then Enter: repeat the last search
+
+### Layout
+
+A terminal program cannot change the font size (that is a terminal setting, usually `Ctrl` + `+` / `-`), but the layout is adjustable:
+
+- `-` / `+`: narrower / wider text column (or `yreader -w 60`)
+- `s`: blank line between paragraphs on / off; when off, paragraphs get a first-line indent instead
+- `d`: single / double line spacing
+
+These settings are remembered.
 
 ### Text and encodings
 
@@ -154,4 +206,4 @@ Images are shown as `<image>`.
 
 ### Reading history
 
-The position in each book, the color and the language are saved on exit to `~/.local/share/yreader/history.json` (or `$XDG_DATA_HOME/yreader/`).
+The position in each book, plus the color, language and layout settings, are saved on exit to `~/.local/share/yreader/history.json` (or `$XDG_DATA_HOME/yreader/`).
