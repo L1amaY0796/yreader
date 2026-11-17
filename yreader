@@ -22,7 +22,7 @@ import zipfile
 from html.parser import HTMLParser
 from urllib.parse import unquote
 
-VERSION = '1.2'
+VERSION = '1.3'
 COLORS = ['white', 'green', 'blue']
 MAX_WIDTH = 100          # 內文最大欄寬
 IMAGE = '<image>'
@@ -92,6 +92,12 @@ STR = {
         'pgap_off': '段落間距: 關（改用首行縮排）',
         'lsp1': '行距: 單行',
         'lsp2': '行距: 雙行',
+        'bm_add': '已加入書籤（共 %d 個，按 M 看清單）',
+        'bm_del': '已移除本頁的書籤',
+        'bm_none': '這本書還沒有書籤（按 m 加入）',
+        'bm_title': '書籤',
+        'bm_hint': '↑↓ 選擇   Enter 前往   d 刪除   M / Esc 關閉',
+        'bm_flag': '[書籤]',
     },
     'en': {
         'desc': 'A lightweight terminal ebook reader (epub / mobi / azw3 / fb2 / html / txt)',
@@ -143,6 +149,12 @@ STR = {
         'pgap_off': 'Paragraph spacing: off (first-line indent)',
         'lsp1': 'Line spacing: single',
         'lsp2': 'Line spacing: double',
+        'bm_add': 'Bookmark added (%d in total, press M for the list)',
+        'bm_del': 'Bookmark removed from this page',
+        'bm_none': 'No bookmarks in this book yet (press m to add one)',
+        'bm_title': 'Bookmarks',
+        'bm_hint': 'Up/Down: select   Enter: go   d: delete   M / Esc: close',
+        'bm_flag': '[BM]',
     },
 }
 HELP = {
@@ -157,6 +169,8 @@ HELP = {
         ('Tab / Shift-Tab', '選取本頁下一個 / 上一個連結'),
         ('Enter', '開啟選取的連結'),
         ('Backspace / b', '返回跳轉前的位置'),
+        ('m', '在此頁加入 / 移除書籤'),
+        ('M', '書籤清單'),
         ('/', '搜尋'),
         ('n / N', '下一個 / 上一個搜尋結果'),
         ('Esc', '結束搜尋並回到搜尋前的頁面'),
@@ -179,6 +193,8 @@ HELP = {
         ('Tab / Shift-Tab', 'Select next / previous link'),
         ('Enter', 'Follow the selected link'),
         ('Backspace / b', 'Go back to where you were'),
+        ('m', 'Add / remove a bookmark on this page'),
+        ('M', 'Bookmark list'),
         ('/', 'Search'),
         ('n / N', 'Next / previous match'),
         ('Esc', 'End search and return to where it started'),
@@ -1264,7 +1280,7 @@ def layout(paras, W, H, pgap=True, lsp=1):
 # 介面
 # --------------------------------------------------------------------------
 class Reader(object):
-    def __init__(self, scr, curses, doc, pos, color, maxw=MAX_WIDTH, pgap=True, lsp=1):
+    def __init__(self, scr, curses, doc, pos, color, maxw=MAX_WIDTH, pgap=True, lsp=1, marks=()):
         self.scr = scr
         self.c = curses
         self.doc = doc
@@ -1285,6 +1301,7 @@ class Reader(object):
         self.bypara = {}          # 段落 -> [(起, 迄, 第幾個結果)]
         self.mi = 0
         self.origin = None        # 搜尋前的位置
+        self.marks = sorted(set(marks))   # 書籤 [(段落, 位移)]
         self.has_color = False
         try:
             curses.curs_set(0)
@@ -1452,6 +1469,8 @@ class Reader(object):
                 right = '%d/%d' % (self.page + 1, self.npages)
             else:
                 right = T('status', self.page + 1, self.npages, 100 * (self.page + 1) // self.npages)
+            if self.marks_here():
+                right = T('bm_flag') + ' ' + right
             self.status(left, right)
         self.msg = ''
         self.scr.refresh()
@@ -1624,6 +1643,81 @@ class Reader(object):
         self.mark = None
         return True
 
+    # ---- 書籤 ----
+    def marks_here(self):
+        return [m for m in self.marks if self.line_of(m) // self.H == self.page]
+
+    def toggle_mark(self):
+        here = self.marks_here()
+        if here:
+            self.marks = [m for m in self.marks if m not in here]
+            self.msg = T('bm_del')
+        else:
+            self.marks = sorted(set(self.marks + [self.position()]))
+            self.msg = T('bm_add', len(self.marks))
+
+    def marks_view(self):
+        c = self.c
+        paras = self.doc.paras
+        start = self.page * self.H
+        cur = 0
+        for i, m in enumerate(self.marks):        # 預設選在目前位置之後的第一個
+            if self.line_of(m) >= start:
+                cur = i
+                break
+        while True:
+            if not self.marks:
+                self.msg = T('bm_none')
+                return
+            cur = min(max(cur, 0), len(self.marks) - 1)
+            rows, cols = self.scr.getmaxyx()
+            h = max(1, rows - 2)
+            w = max(8, min(cols - 4, MAX_WIDTH))
+            x0 = max(0, (cols - w) // 2)
+            top = min(max(0, cur - h // 2), max(0, len(self.marks) - h))
+            attr = self.attr()
+            self.scr.erase()
+            self.put(0, x0, T('bm_title'), attr | c.A_BOLD)
+            for y in range(h):
+                i = top + y
+                if i >= len(self.marks):
+                    break
+                pi, off = self.marks[i]
+                ln = self.line_of((pi, off))
+                pg = str(ln // self.H + 1)
+                chap = ''
+                for j, tl in enumerate(self.toc_lines):
+                    if tl <= ln:
+                        chap = self.doc.toc[j][1]
+                text = ' '.join(paras[min(max(pi, 0), len(paras) - 1)].text[off:off + 120].split())
+                row = clip((chap + ' ─ ' if chap and chap != text else '') + text, w - len(pg) - 2)
+                row += ' ' * (w - len(pg) - swidth(row)) + pg
+                self.put(1 + y, x0, row, attr | (c.A_REVERSE if i == cur else 0))
+            self.status(T('bm_hint'), '%d/%d' % (cur + 1, len(self.marks)))
+            self.scr.refresh()
+            k = self.getkey()
+            if k == c.KEY_RESIZE:
+                self.relayout()
+            elif k in (c.KEY_DOWN, 'j'):
+                cur += 1
+            elif k in (c.KEY_UP, 'k'):
+                cur -= 1
+            elif k in (c.KEY_NPAGE, ' '):
+                cur += h
+            elif k == c.KEY_PPAGE:
+                cur -= h
+            elif k in (c.KEY_HOME, 'g'):
+                cur = 0
+            elif k in (c.KEY_END, 'G'):
+                cur = len(self.marks) - 1
+            elif k in ('d', 'x', c.KEY_DC):
+                del self.marks[cur]
+            elif self.is_enter(k) or k in (c.KEY_RIGHT, 'l'):
+                self.jump(self.marks[cur], mark=True)
+                return
+            elif k in ('M', 'm', 'q', '\x1b', c.KEY_LEFT, 'h'):
+                return
+
     # ---- 版面 ----
     def set_width(self, step):
         cols = self.scr.getmaxyx()[1]
@@ -1763,6 +1857,10 @@ class Reader(object):
                     self.end_search(False)
                 else:
                     self.follow()
+            elif k == 'm':
+                self.toggle_mark()
+            elif k == 'M':
+                self.marks_view()
             elif k == '/':
                 self.search()
             elif k == 'n':
@@ -1928,6 +2026,12 @@ def main():
         maxw = MAX_WIDTH
     pgap = state.get('pgap', True) is not False
     lsp = 2 if state.get('lsp') == 2 else 1
+    marks = []
+    for m in saved.get('marks') or []:
+        try:
+            marks.append((int(m[0]), int(m[1])))
+        except (TypeError, ValueError, IndexError, KeyError):
+            pass
 
     def bye(*_):
         raise SystemExit(0)
@@ -1936,7 +2040,7 @@ def main():
     signal.signal(signal.SIGHUP, bye)
 
     def run(scr):
-        r = Reader(scr, curses, doc, pos, color, maxw, pgap, lsp)
+        r = Reader(scr, curses, doc, pos, color, maxw, pgap, lsp, marks)
         try:
             r.loop()
         except KeyboardInterrupt:
@@ -1946,6 +2050,8 @@ def main():
             books[key] = {'para': pi, 'off': off, 'title': doc.title, 'time': int(time.time())}
             if FORCE_ENC:
                 books[key]['enc'] = FORCE_ENC
+            if r.marks:
+                books[key]['marks'] = [list(m) for m in r.marks]
             state['color'] = COLORS[r.ci]
             state['width'], state['pgap'], state['lsp'] = r.maxw, r.pgap, r.lsp
             if CHOSEN:

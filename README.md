@@ -62,6 +62,8 @@ yreader ebook.epub
 | Tab / Shift-Tab | 選取本頁的下一個 / 上一個連結 |
 | Enter | 開啟選取的連結（註解、內文連結） |
 | Backspace / b | 返回跳轉前的位置 |
+| m | 在此頁加入 / 移除書籤 |
+| M | 書籤清單 |
 | / | 搜尋 |
 | n / N | 下一個 / 上一個搜尋結果 |
 | Esc | 結束搜尋並回到搜尋前的頁面 |
@@ -74,6 +76,13 @@ yreader ebook.epub
 | q | 離開 |
 
 圖片一律顯示為 `<image>`。
+
+### 書籤
+
+- `m`：在目前這頁加入書籤；這頁已有書籤時再按一次就是移除。有書籤的頁面，狀態列會顯示 `[書籤]`。
+- `M`：開啟書籤清單，顯示章節、開頭文字與頁碼。↑↓ 選擇、Enter 前往、`d` 刪除、Esc 關閉。
+
+每本書可以有多個書籤，離開時跟閱讀位置一起保存。前往書籤後按 Backspace 可回到原處。
 
 ### 搜尋
 
@@ -110,7 +119,7 @@ yreader ebook.epub
 
 ### 閱讀紀錄
 
-離開時自動保存每本書的閱讀位置，以及顏色、語言與版面設定，存放在 `~/.local/share/yreader/history.json`
+離開時自動保存每本書的閱讀位置與書籤，以及顏色、語言與版面設定，存放在 `~/.local/share/yreader/history.json`
 （或 `$XDG_DATA_HOME/yreader/`）。位置以段落記錄，改變終端機視窗大小後仍會回到同一處。
 
 ## English
@@ -165,6 +174,8 @@ yreader ebook.epub
 | Tab / Shift-Tab | Select next / previous link on the page |
 | Enter | Follow the selected link (footnotes, cross-references) |
 | Backspace / b | Go back to where you were |
+| m | Add / remove a bookmark on this page |
+| M | Bookmark list |
 | / | Search |
 | n / N | Next / previous match |
 | Esc | End the search and return to the page where it started |
@@ -177,6 +188,13 @@ yreader ebook.epub
 | q | Quit |
 
 Images are shown as `<image>`.
+
+### Bookmarks
+
+- `m`: bookmark the current page; press it again on a bookmarked page to remove it. Bookmarked pages show `[BM]` in the status bar.
+- `M`: open the bookmark list (chapter, first words, page). Up/Down to select, Enter to go, `d` to delete, Esc to close.
+
+A book can have any number of bookmarks; they are saved on exit together with the reading position.
 
 ### Search
 
@@ -206,4 +224,4 @@ These settings are remembered.
 
 ### Reading history
 
-The position in each book, plus the color, language and layout settings, are saved on exit to `~/.local/share/yreader/history.json` (or `$XDG_DATA_HOME/yreader/`).
+The position and bookmarks of each book, plus the color, language and layout settings, are saved on exit to `~/.local/share/yreader/history.json` (or `$XDG_DATA_HOME/yreader/`).
