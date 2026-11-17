@@ -28,10 +28,11 @@ import zipfile
 from html.parser import HTMLParser
 from urllib.parse import unquote, unquote_to_bytes
 
-VERSION = '1.5'
+VERSION = '1.6'
 COLORS = ['white', 'green', 'blue']
 MAX_WIDTH = 100          # 內文最大欄寬
 IMAGE = '<image>'
+BOOK_EXTS = ('.epub', '.mobi', '.azw', '.azw3', '.prc', '.fb2', '.html', '.htm', '.xhtml', '.txt')
 
 WS = re.compile('[ \t\r\n\f\v\u2028\u2029]+')
 CTRL = re.compile('[\x00-\x08\x0b-\x1f\x7f-\x9f\xad\u200b\u2028\u2029\ufeff]')
@@ -58,6 +59,8 @@ STR = {
         'arg_lang': '介面語言：zh 中文 / en English（會記住）',
         'arg_enc': '強制指定文字編碼，例如 big5、gbk、sjis、cp1251（每本書會記住）',
         'arg_dump': '輸出純文字後離開',
+        'arg_list': '列出目前資料夾裡可閱讀的檔案',
+        'list_none': '這個資料夾裡沒有可閱讀的檔案',
         'lang_set': '介面語言已設為中文',
         'lang_now': '語言: 中文',
         'bad_enc': '不認得的編碼: %s',
@@ -120,6 +123,8 @@ STR = {
         'arg_lang': 'interface language: zh (Chinese) / en (English); remembered',
         'arg_enc': 'force a text encoding, e.g. big5, gbk, sjis, cp1251 (remembered per book)',
         'arg_dump': 'print the book as plain text and exit',
+        'arg_list': 'list the readable files in the current folder',
+        'list_none': 'No readable files in this folder',
         'lang_set': 'Interface language set to English',
         'lang_now': 'Language: English',
         'bad_enc': 'unknown encoding: %s',
@@ -2331,6 +2336,25 @@ def ask_lang(default):
     return default
 
 
+def natural_key(name):
+    """讓 第2章 排在 第10章 前面"""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', name)]
+
+
+def list_books():
+    """列出目前資料夾裡副檔名認得的檔案，一行一個"""
+    try:
+        names = [n for n in os.listdir('.') if n.lower().endswith(BOOK_EXTS) and os.path.isfile(n)]
+    except OSError:
+        names = []
+    if not names:
+        sys.stderr.write('yreader: %s\n' % T('list_none'))
+        return 1
+    for n in sorted(names, key=natural_key):
+        print(n)
+    return 0
+
+
 def main():
     global LANG, FORCE_ENC
     try:
@@ -2356,6 +2380,7 @@ def main():
     ap.add_argument('-w', '--width', type=int, metavar='N', help=T('arg_width'))
     ap.add_argument('-l', '--lang', choices=LANGS, help=T('arg_lang'))
     ap.add_argument('-e', '--encoding', metavar='ENC', help=T('arg_enc'))
+    ap.add_argument('--list', '-list', action='store_true', help=T('arg_list'))
     ap.add_argument('--dump', action='store_true', help=T('arg_dump'))
     ap.add_argument('-V', '--version', action='version', version='yreader ' + VERSION)
     args = ap.parse_args()
@@ -2375,6 +2400,8 @@ def main():
             LANG = 'en'
 
     path = args.file
+    if args.list:
+        return list_books()
     if not path:
         recent = sorted(books, key=lambda k: books[k].get('time', 0), reverse=True)
         path = next((p for p in recent if os.path.isfile(p)), None)

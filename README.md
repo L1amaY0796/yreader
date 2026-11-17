@@ -75,6 +75,15 @@ yreader ebook.epub
 - `yreader --lang en`：切換介面語言（zh / en）
 - `yreader -e big5 old.txt`：強制指定文字編碼
 - `yreader --dump ebook.epub`：輸出純文字
+- `yreader --list`：列出可閱讀的檔案（見下方）
+
+### 列出檔案
+
+```bash
+yreader --list
+```
+
+列出目前資料夾裡可閱讀的檔案（epub、mobi、azw、azw3、prc、fb2、html、txt），一行一個。也可以寫成 `yreader -list`。要其他篩選方式，用 `ls` 就可以了。
 
 ### 按鍵
 
@@ -217,6 +226,11 @@ yreader ebook.epub
 - `yreader --lang zh`: change the interface language (zh / en)
 - `yreader -e cp1251 old.txt`: force a text encoding
 - `yreader --dump ebook.epub`: print plain text
+- `yreader --list`: list readable files (see below)
+
+### Listing files
+
+`yreader --list` (or `yreader -list`) prints the readable files in the current folder (epub, mobi, azw, azw3, prc, fb2, html, txt), one per line. For any other filtering, use `ls`.
 
 ### Keys
 
