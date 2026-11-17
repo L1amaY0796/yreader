@@ -4,6 +4,7 @@
 
 支援 epub / mobi / azw / azw3 / prc / fb2 / html / txt。
 只使用 Python 3 標準函式庫，不需安裝任何額外套件。
+Linux / macOS 使用 curses；Windows（PowerShell / cmd）使用內建的 ANSI 終端機後端。
 """
 import argparse
 import codecs
@@ -12,6 +13,7 @@ import locale
 import os
 import posixpath
 import re
+import shutil
 import signal
 import struct
 import sys
@@ -22,7 +24,7 @@ import zipfile
 from html.parser import HTMLParser
 from urllib.parse import unquote
 
-VERSION = '1.3'
+VERSION = '1.4'
 COLORS = ['white', 'green', 'blue']
 MAX_WIDTH = 100          # 內文最大欄寬
 IMAGE = '<image>'
@@ -58,6 +60,7 @@ STR = {
         'drm': '此檔案有 DRM 保護，無法讀取',
         'bad_comp': '不支援的壓縮格式 %d',
         'bad_file': '檔案格式錯誤 (%s)',
+        'no_vt': '這個終端機不支援 ANSI 控制碼（Windows 需要 Windows 10 以上）',
         'empty': '（沒有可顯示的內容）',
         'goto': '跳到頁碼: %s_   (Enter 確認, Esc 取消)',
         'total': '共 %d 頁',
@@ -82,7 +85,7 @@ STR = {
         'arg_width': '內文最大欄寬（會記住）',
         'search_prompt': '搜尋: ',
         'prompt_hint': 'Enter 確認  Esc 取消',
-        'not_found': '找不到「%s」',
+        'no_match': '找不到「%s」',
         'search_status': '搜尋「%s」 %d/%d  n/N:下/上一個  Enter:留下  Esc:返回',
         'wrap_start': '已繞回第一個結果',
         'wrap_end': '已繞到最後一個結果',
@@ -115,6 +118,7 @@ STR = {
         'drm': 'this file is DRM-protected and cannot be read',
         'bad_comp': 'unsupported compression type %d',
         'bad_file': 'malformed file (%s)',
+        'no_vt': 'this terminal does not support ANSI escape codes (Windows 10 or later is required)',
         'empty': '(nothing to display)',
         'goto': 'Go to page: %s_   (Enter: go, Esc: cancel)',
         'total': '%d pages',
@@ -139,7 +143,7 @@ STR = {
         'arg_width': 'maximum text width in columns (remembered)',
         'search_prompt': 'Search: ',
         'prompt_hint': 'Enter: ok  Esc: cancel',
-        'not_found': 'Not found: %s',
+        'no_match': 'Not found: %s',
         'search_status': 'Search "%s" %d/%d  n/N:next  Enter:stay  Esc:back',
         'wrap_start': 'Wrapped to the first match',
         'wrap_end': 'Wrapped to the last match',
@@ -215,6 +219,12 @@ def T(key, *args):
 
 
 def guess_lang():
+    if os.name == 'nt':
+        try:
+            import ctypes
+            return 'zh' if ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3ff == 0x04 else 'en'
+        except Exception:
+            return 'en'
     for v in ('LC_ALL', 'LC_MESSAGES', 'LANG'):
         val = os.environ.get(v)
         if val:
@@ -1204,7 +1214,11 @@ def load(path):
 # 閱讀紀錄
 # --------------------------------------------------------------------------
 def state_path():
-    base = os.environ.get('XDG_DATA_HOME') or os.path.join(os.path.expanduser('~'), '.local', 'share')
+    base = os.environ.get('XDG_DATA_HOME')
+    if not base and os.name == 'nt':
+        base = os.environ.get('APPDATA')
+    if not base:
+        base = os.path.join(os.path.expanduser('~'), '.local', 'share')
     return os.path.join(base, 'yreader', 'history.json')
 
 
@@ -1595,7 +1609,7 @@ class Reader(object):
                 bypara.setdefault(pi, []).append((m.start(), m.end(), len(matches)))
                 matches.append((pi, m.start(), m.end()))
         if not matches:
-            self.msg = T('not_found', q)
+            self.msg = T('no_match', q)
             return
         if not self.matches:              # 連續搜尋時保留最初的位置
             self.origin = self.position()
@@ -1899,6 +1913,201 @@ class Reader(object):
 
 
 # --------------------------------------------------------------------------
+# 不依賴 curses 的終端機後端（ANSI / VT 控制碼）
+# Windows 沒有 curses，所以在 PowerShell / cmd 裡用這個；Python 沒編 curses 的 Linux 也會用到
+# --------------------------------------------------------------------------
+class VTError(Exception):
+    pass
+
+
+class VT(object):
+    """提供 Reader 用到的那一小部分 curses 介面"""
+    error = VTError
+    A_BOLD, A_REVERSE, A_UNDERLINE = 1, 2, 4
+    COLOR_BLACK, COLOR_GREEN, COLOR_BLUE, COLOR_WHITE = 0, 2, 4, 7
+    (KEY_DOWN, KEY_UP, KEY_LEFT, KEY_RIGHT, KEY_HOME, KEY_END, KEY_NPAGE, KEY_PPAGE,
+     KEY_BTAB, KEY_DC, KEY_ENTER, KEY_BACKSPACE, KEY_RESIZE) = range(1000, 1013)
+    pairs = {}
+
+    @staticmethod
+    def curs_set(n):
+        pass
+
+    @staticmethod
+    def has_colors():
+        return True
+
+    @staticmethod
+    def start_color():
+        pass
+
+    @staticmethod
+    def use_default_colors():
+        pass
+
+    @staticmethod
+    def init_pair(n, fg, bg):
+        VT.pairs[n] = fg
+
+    @staticmethod
+    def color_pair(n):
+        return n << 8
+
+    @staticmethod
+    def wrapper(func):
+        restore = VT.setup()
+        out = sys.stdout
+        try:
+            out.write('\x1b[?1049h\x1b[?25l\x1b[?7l')     # 替代畫面、隱藏游標、關閉自動換行
+            out.flush()
+            return func(VTScreen())
+        finally:
+            try:
+                out.write('\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l')
+                out.flush()
+            except (OSError, ValueError):
+                pass
+            restore()
+
+    @staticmethod
+    def setup():
+        """把終端機切到可用的模式，回傳還原用的函式"""
+        if os.name == 'nt':
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            k32.GetStdHandle.restype = ctypes.c_void_p
+            handle = ctypes.c_void_p(k32.GetStdHandle(-11))
+            mode = ctypes.c_uint32()
+            if not k32.GetConsoleMode(handle, ctypes.byref(mode)):
+                raise VTError(T('no_vt'))
+            # ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            if not k32.SetConsoleMode(handle, ctypes.c_uint32(mode.value | 0x0001 | 0x0004)):
+                raise VTError(T('no_vt'))
+            return lambda: k32.SetConsoleMode(handle, mode)
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+        return lambda: termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+class VTScreen(object):
+    encoding = 'utf-8'
+    FG = {VT.COLOR_WHITE: '37', VT.COLOR_GREEN: '32',
+          VT.COLOR_BLUE: '94' if os.name == 'nt' else '34'}   # Windows 主控台的深藍太暗，用亮藍
+    WINKEYS = {'H': VT.KEY_UP, 'P': VT.KEY_DOWN, 'K': VT.KEY_LEFT, 'M': VT.KEY_RIGHT,
+               'G': VT.KEY_HOME, 'O': VT.KEY_END, 'I': VT.KEY_PPAGE, 'Q': VT.KEY_NPAGE,
+               'S': VT.KEY_DC, '\x0f': VT.KEY_BTAB}
+    SEQS = {b'[A': VT.KEY_UP, b'[B': VT.KEY_DOWN, b'[C': VT.KEY_RIGHT, b'[D': VT.KEY_LEFT,
+            b'OA': VT.KEY_UP, b'OB': VT.KEY_DOWN, b'OC': VT.KEY_RIGHT, b'OD': VT.KEY_LEFT,
+            b'[H': VT.KEY_HOME, b'[F': VT.KEY_END, b'OH': VT.KEY_HOME, b'OF': VT.KEY_END,
+            b'[1~': VT.KEY_HOME, b'[4~': VT.KEY_END, b'[7~': VT.KEY_HOME, b'[8~': VT.KEY_END,
+            b'[5~': VT.KEY_PPAGE, b'[6~': VT.KEY_NPAGE, b'[3~': VT.KEY_DC, b'[Z': VT.KEY_BTAB}
+
+    def __init__(self):
+        self.rows = {}
+        self.size = self.getmaxyx()
+        self.buf = b''
+
+    def getmaxyx(self):
+        sz = shutil.get_terminal_size((80, 24))
+        return (max(1, sz.lines), max(1, sz.columns))
+
+    def erase(self):
+        self.rows = {}
+
+    def addstr(self, y, x, s, attr=0):
+        self.rows.setdefault(y, []).append((x, s, attr))
+
+    def refresh(self):
+        out = []
+        for y in range(self.getmaxyx()[0]):
+            out.append('\x1b[%d;1H\x1b[0m\x1b[2K' % (y + 1))
+            for x, s, attr in self.rows.get(y, ()):
+                sgr = ['0']
+                if attr & VT.A_BOLD:
+                    sgr.append('1')
+                if attr & VT.A_UNDERLINE:
+                    sgr.append('4')
+                if attr & VT.A_REVERSE:
+                    sgr.append('7')
+                fg = self.FG.get(VT.pairs.get(attr >> 8))
+                if fg:
+                    sgr.append(fg)
+                out.append('\x1b[%d;%dH\x1b[%sm%s' % (y + 1, x + 1, ';'.join(sgr), s))
+        out.append('\x1b[0m')
+        sys.stdout.write(''.join(out))
+        sys.stdout.flush()
+
+    def resized(self):
+        size = self.getmaxyx()
+        if size != self.size:
+            self.size = size
+            return True
+        return False
+
+    def get_wch(self):
+        return self.key_nt() if os.name == 'nt' else self.key_posix()
+
+    def key_nt(self):
+        import msvcrt
+        while not msvcrt.kbhit():           # 順便偵測視窗大小改變
+            if self.resized():
+                return VT.KEY_RESIZE
+            time.sleep(0.03)
+        ch = msvcrt.getwch()
+        if ch in ('\x00', '\xe0'):          # 方向鍵等功能鍵：兩段式
+            return self.WINKEYS.get(msvcrt.getwch())
+        if ch == '\x03':
+            raise KeyboardInterrupt
+        if '\ud800' <= ch <= '\udbff':      # BMP 以外的字元會分成兩半送來
+            ch = (ch + msvcrt.getwch()).encode('utf-16', 'surrogatepass').decode('utf-16', 'replace')
+        return ch
+
+    def more(self, timeout):
+        import select
+        fd = sys.stdin.fileno()
+        if select.select([fd], [], [], timeout)[0]:
+            data = os.read(fd, 64)
+            if not data:
+                raise SystemExit(0)         # 終端機已關閉
+            self.buf += data
+            return True
+        return False
+
+    def key_posix(self):
+        while not self.buf:
+            if not self.more(0.2) and self.resized():
+                return VT.KEY_RESIZE
+        b = self.buf
+        if b[:1] == b'\x1b':
+            if len(b) == 1 and not self.more(0.05):
+                self.buf = b''
+                return '\x1b'               # 單獨的 Esc
+            b = self.buf
+            for n in (3, 2):
+                key = self.SEQS.get(b[1:1 + n])
+                if key:
+                    self.buf = b[1 + n:]
+                    return key
+            if b[1:2] == b'[':              # 不認得的控制序列：整段丟掉
+                i = 2
+                while i < len(b) and not 0x40 <= b[i] <= 0x7e:
+                    i += 1
+                self.buf = b[i + 1:]
+                return None
+            self.buf = b[1:]
+            return '\x1b'
+        lead = b[0]
+        n = 1 if lead < 0xc0 else 2 if lead < 0xe0 else 3 if lead < 0xf0 else 4
+        while len(self.buf) < n and self.more(0.05):
+            pass
+        ch, self.buf = self.buf[:n], self.buf[n:]
+        return ch.decode('utf-8', 'replace')[:1] or None
+
+
+# --------------------------------------------------------------------------
 # 主程式
 # --------------------------------------------------------------------------
 def dump(doc):
@@ -2014,7 +2223,12 @@ def main():
         return 0
 
     os.environ.setdefault('ESCDELAY', '25')
-    import curses
+    try:
+        if os.name == 'nt' or os.environ.get('YREADER_VT'):
+            raise ImportError
+        import curses
+    except ImportError:               # Windows，或 Python 沒有 curses
+        curses = VT
     try:
         pos = (int(saved.get('para', 0)), int(saved.get('off', 0)))
     except (TypeError, ValueError):
@@ -2036,16 +2250,16 @@ def main():
     def bye(*_):
         raise SystemExit(0)
 
-    signal.signal(signal.SIGTERM, bye)
-    signal.signal(signal.SIGHUP, bye)
+    for name in ('SIGTERM', 'SIGHUP', 'SIGBREAK'):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), bye)
+
+    saver = []
 
     def run(scr):
         r = Reader(scr, curses, doc, pos, color, maxw, pgap, lsp, marks)
-        try:
-            r.loop()
-        except KeyboardInterrupt:
-            pass
-        finally:
+
+        def save():
             pi, off = r.position()
             books[key] = {'para': pi, 'off': off, 'title': doc.title, 'time': int(time.time())}
             if FORCE_ENC:
@@ -2058,7 +2272,34 @@ def main():
                 state['lang'] = CHOSEN
             save_state(state)
 
-    curses.wrapper(run)
+        saver.append(save)
+        try:
+            r.loop()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            save()
+
+    handler = None
+    if os.name == 'nt':               # 直接關掉視窗時也要保存閱讀紀錄
+        try:
+            import ctypes
+
+            def on_ctrl(event):
+                if event in (2, 5, 6) and saver:      # 關閉視窗 / 登出 / 關機
+                    saver[0]()
+                return False
+
+            handler = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)(on_ctrl)
+            ctypes.windll.kernel32.SetConsoleCtrlHandler(handler, True)
+        except Exception:
+            handler = None
+
+    try:
+        curses.wrapper(run)
+    except VTError as e:
+        sys.stderr.write('yreader: %s\n' % e)
+        return 1
     return 0
 
 

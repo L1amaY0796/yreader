@@ -4,11 +4,12 @@
 
 ## 中文
 
-輕量的終端機電子書閱讀器。單一檔案，只需要 Python 3.7 以上（標準函式庫，含 curses），不用安裝任何額外套件。
+輕量的終端機電子書閱讀器。單一檔案，只需要 Python 3.7 以上的標準函式庫，不用安裝任何額外套件。
+可在 Linux、macOS 的終端機，以及 Windows 的 PowerShell / cmd 使用。
 
 支援格式：epub、mobi / azw / prc、azw3 (KF8)、fb2、html、txt。有 DRM 保護的檔案無法讀取。
 
-### 安裝
+### 安裝（Linux / macOS）
 
 用安裝程式（會詢問介面語言：中文或 English）：
 
@@ -35,6 +36,32 @@ export PATH="$HOME/.local/bin:$PATH"
 ```
 
 更新時重跑一次安裝即可；移除則是 `rm ~/.local/bin/yreader`。
+
+### 安裝（Windows PowerShell）
+
+需要先有 Python 3.7 以上（[python.org](https://www.python.org/downloads/)，或 `winget install Python.Python.3.13`）以及 Windows 10 以上。
+
+在 PowerShell 貼上這一行即可，會詢問介面語言：
+
+```powershell
+irm https://raw.githubusercontent.com/L1amaY0796/yreader/main/install.ps1 | iex
+```
+
+或是從 clone 下來的資料夾安裝：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+安裝程式會把程式放到 `%LOCALAPPDATA%\Programs\yreader`，並把這個資料夾加進使用者的 `PATH`。之後在 PowerShell 或 cmd 都可以直接用：
+
+```powershell
+yreader ebook.epub
+```
+
+- 建議使用 Windows Terminal（Windows 11 內建），中文字型與顯示效果最好。
+- 閱讀紀錄存在 `%APPDATA%\yreader\history.json`。
+- 更新：重跑一次安裝指令。移除：刪掉 `%LOCALAPPDATA%\Programs\yreader` 資料夾。
 
 ### 使用
 
@@ -120,15 +147,16 @@ yreader ebook.epub
 ### 閱讀紀錄
 
 離開時自動保存每本書的閱讀位置與書籤，以及顏色、語言與版面設定，存放在 `~/.local/share/yreader/history.json`
-（或 `$XDG_DATA_HOME/yreader/`）。位置以段落記錄，改變終端機視窗大小後仍會回到同一處。
+（或 `$XDG_DATA_HOME/yreader/`；Windows 是 `%APPDATA%\yreader\`）。位置以段落記錄，改變終端機視窗大小後仍會回到同一處。
 
 ## English
 
-A lightweight ebook reader for the terminal. It is a single file that needs only Python 3.7+ (standard library, including curses) and no extra packages.
+A lightweight ebook reader for the terminal. It is a single file that needs only the Python 3.7+ standard library and no extra packages.
+It runs in Linux and macOS terminals, and in PowerShell / cmd on Windows.
 
 Formats: epub, mobi / azw / prc, azw3 (KF8), fb2, html, txt. DRM-protected files cannot be read.
 
-### Install
+### Install (Linux / macOS)
 
 With the installer (it asks for the interface language, Chinese or English):
 
@@ -147,6 +175,24 @@ mkdir -p ~/.local/bin
 curl -fsSL https://raw.githubusercontent.com/L1amaY0796/yreader/main/yreader -o ~/.local/bin/yreader
 chmod +x ~/.local/bin/yreader
 ```
+
+### Install (Windows PowerShell)
+
+Requires Python 3.7+ ([python.org](https://www.python.org/downloads/), or `winget install Python.Python.3.13`) and Windows 10 or later.
+
+Paste this into PowerShell; it asks for the interface language:
+
+```powershell
+irm https://raw.githubusercontent.com/L1amaY0796/yreader/main/install.ps1 | iex
+```
+
+Or, from a clone:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+The installer puts the program in `%LOCALAPPDATA%\Programs\yreader` and adds that folder to your user `PATH`, so `yreader ebook.epub` works in both PowerShell and cmd. Windows Terminal is recommended for the best CJK rendering. The reading history is kept in `%APPDATA%\yreader\history.json`.
 
 ### Usage
 
