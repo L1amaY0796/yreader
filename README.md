@@ -86,8 +86,8 @@ yreader ebook.epub
 | g / G | 第一頁 / 最後一頁 |
 | [ / ] | 上一章 / 下一章 |
 | t | 目錄 |
-| Tab / Shift-Tab | 選取本頁的下一個 / 上一個連結 |
-| Enter | 開啟選取的連結（註解、內文連結） |
+| Tab / Shift-Tab | 選取本頁的下一個 / 上一個連結或圖片 |
+| Enter | 開啟選取的連結（註解、內文連結）；圖片則用外部程式開啟 |
 | Backspace / b | 返回跳轉前的位置 |
 | m | 在此頁加入 / 移除書籤 |
 | M | 書籤清單 |
@@ -102,7 +102,18 @@ yreader ebook.epub
 | ? | 按鍵說明 |
 | q | 離開 |
 
-圖片一律顯示為 `<image>`。
+### 圖片
+
+圖片在內文裡顯示為 `<image>`。用 `Tab` 選到它再按 `Enter`，會把圖片取出來交給系統預設的看圖程式開啟：
+
+- Windows：預設的相片檢視程式
+- WSL：Windows 那邊的預設程式
+- macOS：`open`
+- Linux 桌面：`xdg-open`（需要圖形環境）
+
+想指定程式可以設定環境變數，例如 `export YREADER_IMAGE_VIEWER=feh`。沒有圖形環境（例如純 SSH）時，圖片會存到暫存資料夾並顯示路徑。暫存檔在離開 yreader 時自動刪除。
+
+包在連結裡的圖片以連結為準，按 Enter 是前往連結。
 
 ### 書籤
 
@@ -217,8 +228,8 @@ yreader ebook.epub
 | g / G | First / last page |
 | [ / ] | Previous / next chapter |
 | t | Table of contents |
-| Tab / Shift-Tab | Select next / previous link on the page |
-| Enter | Follow the selected link (footnotes, cross-references) |
+| Tab / Shift-Tab | Select next / previous link or image on the page |
+| Enter | Follow the selected link; open a selected image externally |
 | Backspace / b | Go back to where you were |
 | m | Add / remove a bookmark on this page |
 | M | Bookmark list |
@@ -233,7 +244,11 @@ yreader ebook.epub
 | ? | Help |
 | q | Quit |
 
-Images are shown as `<image>`.
+### Images
+
+Images appear as `<image>` in the text. Select one with `Tab` and press `Enter` to extract it and open it in the system's default image viewer (the default app on Windows and WSL, `open` on macOS, `xdg-open` on a Linux desktop).
+
+Set `YREADER_IMAGE_VIEWER` to use a specific program, e.g. `export YREADER_IMAGE_VIEWER=feh`. Without a graphical environment the image is saved to a temporary folder and its path is shown. Temporary files are removed when yreader exits.
 
 ### Bookmarks
 

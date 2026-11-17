@@ -7,6 +7,8 @@
 Linux / macOS 使用 curses；Windows（PowerShell / cmd）使用內建的 ANSI 終端機後端。
 """
 import argparse
+import atexit
+import base64
 import codecs
 import json
 import locale
@@ -16,15 +18,17 @@ import re
 import shutil
 import signal
 import struct
+import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
 import zipfile
 from html.parser import HTMLParser
-from urllib.parse import unquote
+from urllib.parse import unquote, unquote_to_bytes
 
-VERSION = '1.4'
+VERSION = '1.5'
 COLORS = ['white', 'green', 'blue']
 MAX_WIDTH = 100          # 內文最大欄寬
 IMAGE = '<image>'
@@ -33,6 +37,8 @@ WS = re.compile('[ \t\r\n\f\v\u2028\u2029]+')
 CTRL = re.compile('[\x00-\x08\x0b-\x1f\x7f-\x9f\xad\u200b\u2028\u2029\ufeff]')
 DECOMPOSED = re.compile('[\u0300-\u036f\u1100-\u11ff\u3099\u309a]')
 SCHEME = re.compile(r'^[a-zA-Z][a-zA-Z0-9+.\-]*:')
+EMBED = re.compile(r'kindle:embed:([0-9A-Va-v]+)')
+IMG = 'image:'           # 圖片「連結」的前綴，按 Enter 會用外部程式開啟
 NOSTART = set('，。、；：？！）」』】》〉’”,.;:?!)]}…ー々')    # 不可出現在行首
 NOEND = set('（「『【《〈‘“([{')                               # 不可出現在行尾
 
@@ -101,6 +107,10 @@ STR = {
         'bm_title': '書籤',
         'bm_hint': '↑↓ 選擇   Enter 前往   d 刪除   M / Esc 關閉',
         'bm_flag': '[書籤]',
+        'img_hint': '按 Enter 用外部程式開啟這張圖片',
+        'img_opened': '已用外部程式開啟圖片',
+        'img_missing': '書裡找不到這張圖片的資料',
+        'img_saved': '沒有看圖程式，圖片已存到 %s',
     },
     'en': {
         'desc': 'A lightweight terminal ebook reader (epub / mobi / azw3 / fb2 / html / txt)',
@@ -159,6 +169,10 @@ STR = {
         'bm_title': 'Bookmarks',
         'bm_hint': 'Up/Down: select   Enter: go   d: delete   M / Esc: close',
         'bm_flag': '[BM]',
+        'img_hint': 'Press Enter to open this image in an external viewer',
+        'img_opened': 'Image opened in an external viewer',
+        'img_missing': 'The data for this image was not found in the book',
+        'img_saved': 'No viewer found; image saved to %s',
     },
 }
 HELP = {
@@ -170,8 +184,8 @@ HELP = {
         ('G / End', '最後一頁'),
         ('[  /  ]', '上一章 / 下一章'),
         ('t', '目錄'),
-        ('Tab / Shift-Tab', '選取本頁下一個 / 上一個連結'),
-        ('Enter', '開啟選取的連結'),
+        ('Tab / Shift-Tab', '選取本頁下一個 / 上一個連結或圖片'),
+        ('Enter', '開啟選取的連結；圖片用外部程式開啟'),
         ('Backspace / b', '返回跳轉前的位置'),
         ('m', '在此頁加入 / 移除書籤'),
         ('M', '書籤清單'),
@@ -194,8 +208,8 @@ HELP = {
         ('G / End', 'Last page'),
         ('[  /  ]', 'Previous / next chapter'),
         ('t', 'Table of contents'),
-        ('Tab / Shift-Tab', 'Select next / previous link'),
-        ('Enter', 'Follow the selected link'),
+        ('Tab / Shift-Tab', 'Select next / previous link or image'),
+        ('Enter', 'Follow the link / open the image externally'),
         ('Backspace / b', 'Go back to where you were'),
         ('m', 'Add / remove a bookmark on this page'),
         ('M', 'Bookmark list'),
@@ -347,6 +361,21 @@ class Doc(object):
         self.open = None          # (href, start)
         self.nextgap = 1
         self.newpage = False
+        self.blobs = []           # 內嵌在 HTML 裡的 data: 圖片
+        self.image_loader = None  # 依格式而定：key -> 圖片的位元組
+
+    def add_image(self, key):
+        """加入 <image> 佔位文字；找得到圖片來源時讓它可以被選取"""
+        s = self.curlen
+        self.add(IMAGE)
+        if key and not self.open:         # 圖片本身包在連結裡時，以連結為準
+            self.curlinks.append((s, self.curlen, IMG + key))
+
+    def get_image(self, key):
+        if key.startswith('blob:'):
+            head, _, data = self.blobs[int(key[5:])].partition(',')
+            return base64.b64decode(data) if ';base64' in head.lower() else unquote_to_bytes(data)
+        return self.image_loader(key)
 
     def add(self, s):
         if s:
@@ -457,6 +486,8 @@ class ContentParser(HTMLParser):
         self.skip = 0
         self.h = False
         self.pre = False
+        self.in_svg = False
+        self.svg_src = None
 
     def run(self, text):
         try:
@@ -464,7 +495,34 @@ class ContentParser(HTMLParser):
             self.close()
         except Exception:
             pass
+        if self.in_svg:                   # 沒有關閉的 <svg>
+            self.in_svg = False
+            self.doc.add_image(self.svg_src)
         self.doc.flush(self.style())
+
+    def image_key(self, attrs):
+        """從 <img> / <image> 的屬性找出圖片來源"""
+        a = dict(attrs)
+        rec = (a.get('recindex') or '').strip()          # mobi
+        if rec.isdigit():
+            return 'rec:%d' % int(rec)
+        src = a.get('src')
+        if not src:
+            for k, v in attrs:
+                if v and (k == 'href' or k.endswith(':href')):
+                    src = v
+        if not src:
+            return None
+        src = src.strip()
+        m = EMBED.match(src)                             # azw3
+        if m:
+            return 'rec:%d' % int(m.group(1), 32)
+        if src[:5].lower() == 'data:':
+            self.doc.blobs.append(src)
+            return 'blob:%d' % (len(self.doc.blobs) - 1)
+        if SCHEME.match(src):
+            return None                                  # 網路上的圖片不處理
+        return resolve(self.base, src)
 
     def style(self):
         return 'pre' if self.pre else 'h' if self.h else 'p'
@@ -474,10 +532,13 @@ class ContentParser(HTMLParser):
         if self.skip:
             if tag in self.skips:
                 self.skip += 1
+            elif tag == 'image' and self.in_svg and self.svg_src is None:
+                self.svg_src = self.image_key(attrs)
             return
         if tag in self.skips:
-            if tag == 'svg':
-                d.add(IMAGE)
+            if tag == 'svg':              # 整個 <svg> 當成一張圖，結束時再加入
+                self.in_svg = True
+                self.svg_src = None
             self.skip = 1
             return
         a = dict(attrs)
@@ -493,7 +554,7 @@ class ContentParser(HTMLParser):
             d.add('* * *')
             d.flush('hr')
         elif tag in ('img', 'image'):
-            d.add(IMAGE)
+            d.add_image(self.image_key(attrs))
         elif tag in self.heads:
             self.h = True
         elif tag == 'pre':
@@ -523,6 +584,9 @@ class ContentParser(HTMLParser):
         if self.skip:
             if tag in self.skips:
                 self.skip -= 1
+                if not self.skip and self.in_svg:
+                    self.in_svg = False
+                    d.add_image(self.svg_src)
             return
         if tag == 'a':
             d.close_link()
@@ -773,6 +837,7 @@ def load_epub(path, doc):
         elif t == 'title' and not doc.title:
             doc.title = ' '.join((e.text or '').split())
 
+    doc.image_loader = read
     for idref in spine:
         if idref not in manifest:
             continue
@@ -783,7 +848,7 @@ def load_epub(path, doc):
             continue
         doc.start_file(href)
         if mt.startswith('image/'):
-            doc.add(IMAGE)
+            doc.add_image(href)
             continue
         ContentParser(doc, href).run(decode(raw))
 
@@ -1015,6 +1080,7 @@ class Mobi(object):
             return struct.unpack_from('>L', h, off)[0] if off + 4 <= len(h) else NONE
 
         ismobi = h[16:20] == b'MOBI'
+        self.first_img = u32(0x6c) if ismobi else NONE   # 第一筆圖片紀錄
         codec, ver, extra, title = 'cp1252', 1, 0, ''
         if ismobi:
             hlen = u32(20)
@@ -1169,7 +1235,15 @@ class Mobi(object):
 def load_mobi(path, doc):
     with open(path, 'rb') as f:
         data = f.read()
-    doc.title, text, doc.rawtoc = Mobi(data).extract()
+    m = Mobi(data)
+    doc.title, text, doc.rawtoc = m.extract()
+
+    def image(key):
+        if not key.startswith('rec:') or m.first_img == NONE:
+            return None
+        return m.rec(m.first_img + int(key[4:]) - 1)
+
+    doc.image_loader = image
     ContentParser(doc, '').run(text)
 
 
@@ -1199,8 +1273,23 @@ def load(path):
         with open(path, 'rb') as f:
             raw = f.read()
         if b'<FictionBook' in head or ext == '.fb2':
-            ContentParser(doc, '', fb2=True).run(decode(raw))
+            def fb2_image(key):       # <binary id="..."> 裡的 base64
+                m = re.search(br'<binary[^>]*\bid\s*=\s*["\']' + re.escape(key.lstrip('#').encode('utf-8'))
+                              + br'["\'][^>]*>([^<]*)<', raw)
+                return base64.b64decode(m.group(1)) if m else None
+
+            doc.image_loader = fb2_image
+            # 新版 Python 會把 <title> 的內容當純文字，先改名才能正確解析 FB2 的標題
+            text = re.sub(r'<(/?)title\b', r'<\1subtitle', decode(raw))
+            ContentParser(doc, '', fb2=True).run(text)
         elif ext in ('.html', '.htm', '.xhtml') or re.search(br'<html|<!doctype html', head, re.I):
+            folder = os.path.dirname(os.path.abspath(path))
+
+            def html_image(key):      # 相對於 HTML 檔所在資料夾
+                with open(os.path.join(folder, key.split('#')[0]), 'rb') as f:
+                    return f.read()
+
+            doc.image_loader = html_image
             ContentParser(doc, '').run(decode(raw))
         else:
             load_text(raw, doc)
@@ -1208,6 +1297,78 @@ def load(path):
     if not doc.title:
         doc.title = os.path.splitext(os.path.basename(path))[0]
     return doc
+
+
+# --------------------------------------------------------------------------
+# 用外部程式開啟圖片
+# --------------------------------------------------------------------------
+_tmp = {'dir': None, 'files': {}}
+
+
+def image_ext(data):
+    head = data[:16]
+    if head[:3] == b'\xff\xd8\xff':
+        return '.jpg'
+    if head[:8] == b'\x89PNG\r\n\x1a\n':
+        return '.png'
+    if head[:4] == b'GIF8':
+        return '.gif'
+    if head[:4] == b'RIFF' and head[8:12] == b'WEBP':
+        return '.webp'
+    if head[:2] == b'BM':
+        return '.bmp'
+    if b'<svg' in data[:2048]:
+        return '.svg'
+    return '.img'
+
+
+def save_image(key, data):
+    """把圖片寫到暫存資料夾（離開時自動刪除），回傳路徑"""
+    if key in _tmp['files']:
+        return _tmp['files'][key]
+    if _tmp['dir'] is None:
+        _tmp['dir'] = tempfile.mkdtemp(prefix='yreader-')
+        atexit.register(shutil.rmtree, _tmp['dir'], True)
+    path = os.path.join(_tmp['dir'], 'image-%03d%s' % (len(_tmp['files']) + 1, image_ext(data)))
+    with open(path, 'wb') as f:
+        f.write(data)
+    _tmp['files'][key] = path
+    return path
+
+
+def spawn(argv):
+    kw = {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL}
+    if os.name != 'nt':
+        kw['start_new_session'] = True        # 不要讓看圖程式跟著閱讀器一起被關掉
+    subprocess.Popen(argv, **kw)
+    return True
+
+
+def open_external(path):
+    """用系統預設的看圖程式開啟；可用環境變數 YREADER_IMAGE_VIEWER 指定程式"""
+    try:
+        custom = os.environ.get('YREADER_IMAGE_VIEWER')
+        if custom:
+            import shlex
+            return spawn(shlex.split(custom, posix=os.name != 'nt') + [path])
+        if os.name == 'nt':
+            os.startfile(path)
+            return True
+        if sys.platform == 'darwin':
+            return spawn(['open', path])
+        if os.environ.get('WSL_DISTRO_NAME') or 'microsoft' in os.uname().release.lower():
+            if shutil.which('wslview'):       # WSL：交給 Windows 那邊的看圖程式
+                return spawn(['wslview', path])
+            if shutil.which('wslpath') and shutil.which('explorer.exe'):
+                win = subprocess.check_output(['wslpath', '-w', path]).decode('utf-8', 'replace').strip()
+                return spawn(['explorer.exe', win])
+        if os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'):
+            for cmd in ('xdg-open', 'gio', 'eog', 'feh', 'display'):
+                if shutil.which(cmd):
+                    return spawn([cmd, 'open', path] if cmd == 'gio' else [cmd, path])
+    except Exception:
+        pass
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -1485,6 +1646,9 @@ class Reader(object):
                 right = T('status', self.page + 1, self.npages, 100 * (self.page + 1) // self.npages)
             if self.marks_here():
                 right = T('bm_flag') + ' ' + right
+            cols = self.scr.getmaxyx()[1]
+            if self.msg and swidth(left) > cols - 3 - swidth(right):
+                right = ''                # 訊息太長時（例如檔案路徑）讓出整列
             self.status(left, right)
         self.msg = ''
         self.scr.refresh()
@@ -1527,6 +1691,8 @@ class Reader(object):
             self.sel = links[(links.index(self.sel) + step) % len(links)]
         else:
             self.sel = links[0 if step > 0 else -1]
+        if self.doc.paras[self.sel[0]].links[self.sel[1]][2].startswith(IMG):
+            self.msg = T('img_hint')
 
     def follow(self):
         if self.sel is None:
@@ -1534,6 +1700,9 @@ class Reader(object):
             return
         pi, k = self.sel
         href = self.doc.paras[pi].links[k][2]
+        if href.startswith(IMG):
+            self.open_image(href[len(IMG):])
+            return
         if SCHEME.match(href):
             self.msg = T('ext_link', href)
             return
@@ -1542,6 +1711,21 @@ class Reader(object):
             self.msg = T('no_target', href)
             return
         self.jump(t, mark=True)
+
+    def open_image(self, key):
+        try:
+            data = self.doc.get_image(key)
+        except Exception:
+            data = None
+        if not data:
+            self.msg = T('img_missing')
+            return
+        try:
+            path = save_image(key, data)
+        except OSError as e:
+            self.msg = str(e)
+            return
+        self.msg = T('img_opened') if open_external(path) else T('img_saved', path)
 
     def back(self):
         if not self.hist:
